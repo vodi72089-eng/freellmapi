@@ -26,3 +26,8 @@ export interface Db {
 /** Factory that opens (or creates) a database at the given resolved path and
  *  returns it as a Db. Pragmas and migrations are applied by the caller. */
 export type DbFactory = (resolvedPath: string) => Db;
+
+export interface PostgresDb extends Db {
+  readonly isPostgres: true;
+  pool: unknown; // pg.Pool
+}
