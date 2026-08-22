@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { runMigrationsSync } from './migrate/runner.js';
 import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
 import { restrictAllToOwner, restrictDirToOwner } from '../lib/file-permissions.js';
+import { createPostgresDb } from './postgres.js';
 import { nodeSqliteFactory } from './node-sqlite.js';
 import type { Db, DbFactory } from './types.js';
 
@@ -43,6 +44,9 @@ function betterSqliteFactory(resolvedPath: string): Db {
 }
 
 export function defaultDbFactory(platform: NodeJS.Platform = process.platform): DbFactory {
+  if (process.env.DATABASE_URL) {
+    return () => createPostgresDb();
+  }
   return platform === 'android' ? nodeSqliteFactory : betterSqliteFactory;
 }
 
@@ -56,16 +60,14 @@ export function connectDb(
     factory?: DbFactory;
   },
 ): Db {
+  const isPostgres = !!process.env.DATABASE_URL;
   const resolvedPath = dbPath ?? getDefaultDbPath();
   const isMemory = resolvedPath === ':memory:';
   const ensureDir = opts?.ensureDir ?? true;
   const factory = opts?.factory ?? defaultDbFactory();
 
-  // Gated on ensureDir along with the mkdir: that flag means "this process does
-  // not shape the filesystem here", and changing a directory's permissions is
-  // exactly that kind of change. It also keeps the warning below from firing on
-  // every boot in the read-only environments the flag exists for.
-  if (!isMemory && ensureDir) {
+  // SQLite-specific directory creation and permission hardening — skip for PostgreSQL
+  if (!isPostgres && !isMemory && ensureDir) {
     const dataDir = path.dirname(resolvedPath);
     let created = false;
     if (!fs.existsSync(dataDir)) {
@@ -79,14 +81,17 @@ export function connectDb(
   }
 
   db = factory(resolvedPath);
-  if (!isMemory) db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  // The dashboard and the proxy hot path write concurrently; without a busy
-  // timeout the loser of a write race gets SQLITE_BUSY immediately and the
-  // request fails. Five seconds is far longer than any write here takes.
-  db.pragma('busy_timeout = 5000');
+  // SQLite-specific pragmas — only apply when not using PostgreSQL
+  if (!isPostgres) {
+    if (!isMemory) db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+    // The dashboard and the proxy hot path write concurrently; without a busy
+    // timeout the loser of a write race gets SQLITE_BUSY immediately and the
+    // request fails. Five seconds is far longer than any write here takes.
+    db.pragma('busy_timeout = 5000');
+  }
 
-  if (!isMemory) restrictDbFilePermissions(resolvedPath);
+  if (!isPostgres && !isMemory) restrictDbFilePermissions(resolvedPath);
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
@@ -202,8 +207,8 @@ export function initDb(
 
   if (process.env.NODE_ENV !== 'development') {
     runMigrationsSync(db, 'up');
-  } else {
-    // In dev, verify the DB has been initialised. If not, give a clear error.
+  } else if (!process.env.DATABASE_URL) {
+    // In dev with SQLite, verify the DB has been initialised. If not, give a clear error.
     const ready = db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'"
     ).get();
