@@ -32,63 +32,81 @@ function hasColumn(db: Db, table: string, column: string): boolean {
 function prepare(db: Db, sql: string) {
   if (!isPostgres) return db.prepare(sql);
   let converted = pg(sql);
-  // INSERT OR IGNORE INTO → INSERT INTO ... ON CONFLICT DO NOTHING
   converted = converted.replace(
     /INSERT\s+OR\s+IGNORE\s+INTO\s+/i,
     'INSERT INTO ',
   );
-  // Append ON CONFLICT DO NOTHING if not already present and the INSERT has no ON CONFLICT
   if (!/ON\s+CONFLICT/i.test(converted)) {
     converted = converted.replace(/;?\s*$/, ' ON CONFLICT DO NOTHING;');
   }
   return db.prepare(converted);
 }
 
-export function up(db: Db): void {
+/**
+ * Universal statement executor — works on both SQLite (sync) and PostgreSQL (async).
+ * Usage: await runStatement(db, 'UPDATE ...', param1, param2);
+ */
+async function runStatement(db: Db, sql: string, ...params: unknown[]): Promise<{ lastInsertRowid?: number | bigint; changes: number }> {
+  const stmt = db.prepare(sql);
+  if (isPostgres && stmt.runAsync) {
+    return stmt.runAsync(...params);
+  }
+  return stmt.run(...params);
+}
+
+/** Universal query executor — works on both SQLite (sync) and PostgreSQL (async). */
+async function queryAll(db: Db, sql: string, ...params: unknown[]): Promise<unknown[]> {
+  const stmt = db.prepare(sql);
+  if (isPostgres && stmt.allAsync) {
+    return stmt.allAsync(...params);
+  }
+  return stmt.all(...params);
+}
+
+/** Universal single-row query executor. */
+async function queryOne(db: Db, sql: string, ...params: unknown[]): Promise<unknown> {
+  const stmt = db.prepare(sql);
+  if (isPostgres && stmt.getAsync) {
+    return stmt.getAsync(...params);
+  }
+  return stmt.get(...params);
+}
+
+export async function up(db: Db): Promise<void> {
   createTables(db);
   initEncryptionKey(db);
-  seedModels(db);
-  migrateModels(db);
-  migrateModelsV2(db);
-  migrateModelsV3Ranks(db);
-  migrateModelsV4(db);
-  migrateModelsV5(db);
-  migrateModelsV6(db);
-  migrateModelsV7(db);
-  migrateModelsV8(db);
-  migrateModelsV9(db);
-  migrateModelsV10(db);
-  migrateModelsV11(db);
-  migrateModelsV12(db);
-  migrateModelsV13(db);
-  migrateModelsV14(db);
-  migrateModelsV15(db);
-  migrateModelsV16Vision(db);
-  migrateModelsV17IntelligenceTiers(db);
-  migrateModelsV18OpenCodeZen(db);
-  migrateModelsV19Gemma4(db);
-  migrateModelsV20KiloFree(db);
-  migrateModelsV21PruneDead(db);
-  migrateModelsV22Tools(db);
-  migrateModelsV23FreeTierAudit(db);
-  migrateModelsV24ZenRefresh(db);
-  migrateModelsV25ZenDeadPromos(db);
-  // V25 is the LAST model-data migration. Since the Premium live catalog
-  // shipped (June 2026), model/limit DATA is maintained in the published
-  // catalog (served signed by the catalog service) and reaches installs via
-  // catalog-sync — premium on the live tier within ~12h, free at the monthly
-  // promote. Shipping model data as a
-  // migration would hand it to free users on their next binary update,
-  // bypassing the tier gate. Migrations from here on are baseline/code-level
-  // only (schema, family rules, provider plumbing, quirk-seed corrections).
-  // After all model migrations: add/refresh paid-equivalent pricing
-  // (drives the realistic "Est. savings" analytics stat).
+  await seedModels(db);
+  await migrateModels(db);
+  await migrateModelsV2(db);
+  await migrateModelsV3Ranks(db);
+  await migrateModelsV4(db);
+  await migrateModelsV5(db);
+  await migrateModelsV6(db);
+  await migrateModelsV7(db);
+  await migrateModelsV8(db);
+  await migrateModelsV9(db);
+  await migrateModelsV10(db);
+  await migrateModelsV11(db);
+  await migrateModelsV12(db);
+  await migrateModelsV13(db);
+  await migrateModelsV14(db);
+  await migrateModelsV15(db);
+  await migrateModelsV16Vision(db);
+  await migrateModelsV17IntelligenceTiers(db);
+  await migrateModelsV18OpenCodeZen(db);
+  await migrateModelsV19Gemma4(db);
+  await migrateModelsV20KiloFree(db);
+  await migrateModelsV21PruneDead(db);
+  await migrateModelsV22Tools(db);
+  await migrateModelsV23FreeTierAudit(db);
+  await migrateModelsV24ZenRefresh(db);
+  await migrateModelsV25ZenDeadPromos(db);
   applyModelPricing(db);
-  migrateEmbeddingsV1(db);
-  migrateMediaV1(db);
-  migrateQuirksV1(db);
-  ensureUnifiedKey(db);
-  migrateProfilesInit(db);
+  await migrateEmbeddingsV1(db);
+  await migrateMediaV1(db);
+  await migrateQuirksV1(db);
+  await ensureUnifiedKey(db);
+  await migrateProfilesInit(db);
 }
 
 export function down(_db: Db): void {
@@ -475,8 +493,8 @@ function ensureModelsKeyIdColumn(db: Db) {
   }
 }
 
-function seedModels(db: Db) {
-  const count = db.prepare('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
+async function seedModels(db: Db): Promise<void> {
+  const count = (await queryOne(db, 'SELECT COUNT(*) as cnt FROM models')) as { cnt: number };
   if (count.cnt > 0) return;
 
   const insertSql = isPostgres

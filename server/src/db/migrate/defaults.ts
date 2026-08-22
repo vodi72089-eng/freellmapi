@@ -24,8 +24,8 @@ import * as apiKeyProxy from '../migrations/20260810_000001_api_key_proxy.js';
 import * as playgroundConversations from '../migrations/20260820_000001_playground_conversations.js';
 
 export interface MigrationModule {
-  up(db: Db): void;
-  down(db: Db): void;
+  up(db: Db): void | Promise<void>;
+  down(db: Db): void | Promise<void>;
 }
 
 export interface DefaultMigration {

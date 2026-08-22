@@ -2,6 +2,10 @@ export interface DbStatement {
   get(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
   run(...params: unknown[]): { lastInsertRowid?: number | bigint; changes: number };
+  /** Async variant — works on both SQLite and PostgreSQL. */
+  runAsync?(...params: unknown[]): Promise<{ lastInsertRowid?: number | bigint; changes: number }>;
+  getAsync?(...params: unknown[]): Promise<unknown>;
+  allAsync?(...params: unknown[]): Promise<unknown[]>;
 }
 
 export interface Db {

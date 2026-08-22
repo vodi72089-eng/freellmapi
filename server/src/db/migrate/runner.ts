@@ -191,7 +191,7 @@ async function runPendingMigrations(
 
     if (isPostgres()) {
       const applyMigration = db.transaction(async () => {
-        migration.up(db);
+        await migration.up(db);
         await (db as any).query(
           'INSERT INTO migrations (filename) VALUES ($1)',
           [record.filename],
@@ -235,7 +235,7 @@ async function runLatestDownMigration(
 
   if (isPostgres()) {
     const revertMigration = db.transaction(async () => {
-      migration.down(db);
+      await migration.down(db);
       await (db as any).query(
         'DELETE FROM migrations WHERE filename = $1',
         [row.filename],
