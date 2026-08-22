@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'url';
-import { runMigrationsSync } from './migrate/runner.js';
+import { runMigrationsSync, runMigrations } from './migrate/runner.js';
 import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
 import { restrictAllToOwner, restrictDirToOwner } from '../lib/file-permissions.js';
 import { createPostgresDb } from './postgres.js';
@@ -205,10 +205,16 @@ export function initDb(
 ): Db {
   const db = connectDb(dbPath, opts);
 
-  if (process.env.NODE_ENV !== 'development') {
+  if (process.env.DATABASE_URL) {
+    // PostgreSQL: run async migrations
+    runMigrations(db, 'up').catch(err => {
+      console.error('PostgreSQL migration error:', err);
+      process.exit(1);
+    });
+  } else if (process.env.NODE_ENV !== 'development') {
     runMigrationsSync(db, 'up');
-  } else if (!process.env.DATABASE_URL) {
-    // In dev with SQLite, verify the DB has been initialised. If not, give a clear error.
+  } else {
+    // In dev with SQLite, verify the DB has been initialised.
     const ready = db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'"
     ).get();

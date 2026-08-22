@@ -2,36 +2,32 @@
 // Created: 2026-07-29
 //
 // DOWN: reversible (throws when duplicates exist — see below)
-//
-// `models` was unique on (platform, model_id). Every custom relay is stored
-// under platform = 'custom', so two relays offering the same model id could not
-// coexist: the second registration silently rebound the first one's row. One
-// enabled flag, one set of ranks, one stats bucket — turning the model off
-// because relay A was broken turned it off for relay B as well (#619).
-//
-// This adds `endpoint_scope` (the endpoint's normalized base_url, '' for every
-// catalog platform) and moves uniqueness to (platform, model_id,
-// endpoint_scope). Catalog rows all share the '' scope, so their constraint is
-// bit-for-bit the old one; only custom rows gain room for a sibling.
-//
-// SQLite cannot drop a table-level UNIQUE, so `models` is rebuilt. Two details
-// make that safe on a live DB:
-//   - row ids are copied verbatim, so fallback_config / profile_models /
-//     saved fusion configs keep pointing at the same models;
-//   - `PRAGMA foreign_keys` is a no-op inside a transaction and the migration
-//     runner wraps up() in one, so the child rows are parked in temp tables
-//     across the DROP and restored after the rename. Renaming `models` itself
-//     is avoided on purpose: with foreign keys on, a rename rewrites the
-//     REFERENCES clauses of every child table to the new name.
-//
-// Schema only — no catalog data.
 
 import type { Db } from '../types.js';
 
-// The models table as of this migration, plus the new column. Written out in
-// full rather than derived, so the rebuilt schema is auditable here and
-// identical on every run.
-const MODELS_COLUMNS = `
+const isPostgres = !!process.env.DATABASE_URL;
+
+function pg(sql: string): string {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
+function hasColumn(db: Db, table: string, column: string): boolean {
+  if (isPostgres) {
+    const row = db.prepare(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = $2
+      ) AS exists`,
+    ).get(table, column) as { exists: boolean } | undefined;
+    return row?.exists ?? false;
+  }
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return columns.some(col => col.name === column);
+}
+
+// SQLite path: rebuild the table (SQLite cannot ALTER UNIQUE constraints)
+const MODELS_COLUMNS_SQLITE = `
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       platform TEXT NOT NULL,
       model_id TEXT NOT NULL,
@@ -60,9 +56,28 @@ const CARRIED_COLUMNS = [
   'supports_tools', 'paid_input_per_m', 'paid_output_per_m', 'source',
 ].join(', ');
 
-// Tables whose rows must survive the DROP. Discovered from the schema rather
-// than hard-coded, so a table added later that references models is carried too.
 function childTablesOfModels(db: Db): string[] {
+  if (isPostgres) {
+    const tables = db.prepare(`
+      SELECT table_name AS name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name <> 'models'
+      ORDER BY table_name
+    `).all() as { name: string }[];
+    return tables
+      .filter(t => {
+        const fks = db.prepare(`
+          SELECT ccu.table_name AS table
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.constraint_column_usage ccu
+            ON tc.constraint_name = ccu.constraint_name
+          WHERE tc.constraint_type = 'FOREIGN KEY'
+            AND tc.table_name = $1
+            AND ccu.table_name = 'models'
+        `).all(t.name) as { table: string }[];
+        return fks.length > 0;
+      })
+      .map(t => t.name);
+  }
   const tables = db.prepare(`
     SELECT name FROM sqlite_master
      WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'models'
@@ -74,14 +89,8 @@ function childTablesOfModels(db: Db): string[] {
     .map(t => t.name);
 }
 
-function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, unique: string): void {
+function rebuildModelsSqlite(db: Db, extraColumns: string, copiedColumns: string, unique: string): void {
   const children = childTablesOfModels(db);
-  // AUTOINCREMENT's high-water mark. DROP TABLE takes the sqlite_sequence row
-  // with it, and copying rows back only pushes the counter to the highest id
-  // PRESENT — so a table whose top rows were deleted (catalog sync prunes
-  // models routinely) would start handing out ids it has already used. Stale
-  // fallback_config / profile_models rows pointing at a deleted model would
-  // then silently adopt an unrelated new one.
   const seqRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'models'")
     .get() as { seq: number } | undefined;
   for (const child of children) {
@@ -90,7 +99,7 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
   }
 
   db.exec(`
-    CREATE TABLE models_endpoint_identity (${MODELS_COLUMNS}${extraColumns},
+    CREATE TABLE models_endpoint_identity (${MODELS_COLUMNS_SQLITE}${extraColumns},
       ${unique}
     );
     INSERT INTO models_endpoint_identity (${copiedColumns})
@@ -100,8 +109,6 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
   `);
 
   if (seqRow) {
-    // sqlite_sequence has no unique index, so no upsert: update the row the
-    // rename carried over, or re-create it if the table was empty.
     const restored = db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'models' AND seq < ?")
       .run(seqRow.seq, seqRow.seq);
     if (restored.changes === 0
@@ -116,24 +123,55 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
   }
 }
 
+function rebuildModelsPostgres(db: Db): void {
+  // PostgreSQL: add column and create new unique constraint, drop old one
+  if (!hasColumn(db, 'models', 'endpoint_scope')) {
+    db.prepare("ALTER TABLE models ADD COLUMN endpoint_scope TEXT NOT NULL DEFAULT ''").run();
+  }
+
+  // Drop old unique constraint if it exists, create new one
+  db.exec(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'models_platform_model_id_key') THEN
+        ALTER TABLE models DROP CONSTRAINT models_platform_model_id_key;
+      END IF;
+    END $$;
+  `);
+  db.exec(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'models_platform_model_id_endpoint_scope_key') THEN
+        ALTER TABLE models ADD CONSTRAINT models_platform_model_id_endpoint_scope_key
+          UNIQUE (platform, model_id, endpoint_scope);
+      END IF;
+    END $$;
+  `);
+}
+
 export function up(db: Db): void {
-  rebuildModels(
-    db,
-    `,\n      endpoint_scope TEXT NOT NULL DEFAULT ''`,
-    CARRIED_COLUMNS,
-    'UNIQUE(platform, model_id, endpoint_scope)',
-  );
+  if (isPostgres) {
+    rebuildModelsPostgres(db);
+  } else {
+    rebuildModelsSqlite(
+      db,
+      `,\n      endpoint_scope TEXT NOT NULL DEFAULT ''`,
+      CARRIED_COLUMNS,
+      'UNIQUE(platform, model_id, endpoint_scope)',
+    );
+  }
 
   // Backfill: a custom row's scope is the base_url of the key it is bound to.
-  // Rows whose key is gone (or that predate per-endpoint binding) keep '' —
-  // exactly the identity they have today, so nothing about them changes.
   const bound = db.prepare(`
     SELECT m.id AS id, k.base_url AS base_url
       FROM models m
       JOIN api_keys k ON k.id = m.key_id AND k.platform = 'custom'
      WHERE m.platform = 'custom' AND k.base_url IS NOT NULL AND k.base_url <> ''
   `).all() as { id: number; base_url: string }[];
-  const setScope = db.prepare('UPDATE models SET endpoint_scope = ? WHERE id = ?');
+  const setScopeSql = isPostgres
+    ? pg('UPDATE models SET endpoint_scope = ? WHERE id = ?')
+    : 'UPDATE models SET endpoint_scope = ? WHERE id = ?';
+  const setScope = db.prepare(setScopeSql);
   for (const row of bound) {
     setScope.run(row.base_url.trim().replace(/\/+$/, ''), row.id);
   }
@@ -145,9 +183,6 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  // Going back means two relays' copies of one model id would have to share a
-  // row again, and there is no honest way to pick which endpoint's settings
-  // survive. Refuse rather than silently discard one.
   const collisions = db.prepare(`
     SELECT platform, model_id, COUNT(*) AS n
       FROM models GROUP BY platform, model_id HAVING COUNT(*) > 1
@@ -161,5 +196,31 @@ export function down(db: Db): void {
   }
 
   db.exec('DROP INDEX IF EXISTS idx_models_endpoint_scope;');
-  rebuildModels(db, '', CARRIED_COLUMNS, 'UNIQUE(platform, model_id)');
+
+  if (isPostgres) {
+    // Drop the 3-column unique constraint, restore 2-column one
+    db.exec(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'models_platform_model_id_endpoint_scope_key') THEN
+          ALTER TABLE models DROP CONSTRAINT models_platform_model_id_endpoint_scope_key;
+        END IF;
+      END $$;
+    `);
+    db.exec(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'models_platform_model_id_key') THEN
+          ALTER TABLE models ADD CONSTRAINT models_platform_model_id_key
+            UNIQUE (platform, model_id);
+        END IF;
+      END $$;
+    `);
+    // Drop endpoint_scope column
+    if (hasColumn(db, 'models', 'endpoint_scope')) {
+      db.prepare('ALTER TABLE models DROP COLUMN endpoint_scope').run();
+    }
+  } else {
+    rebuildModelsSqlite(db, '', CARRIED_COLUMNS, 'UNIQUE(platform, model_id)');
+  }
 }

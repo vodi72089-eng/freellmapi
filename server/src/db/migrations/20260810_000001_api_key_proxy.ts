@@ -1,24 +1,22 @@
 import type { Db } from '../types.js';
 
-/**
- * Per-key proxy override (#590): a key can carry its own proxy URL
- * (http/https/socks4/socks4a/socks5/socks5h) so the same provider can be
- * reached from different exit IPs while the global proxy stays the default.
- *
- * The URL is stored ENCRYPTED, not as plain text: a proxy URL routinely
- * embeds `user:pass@` credentials, which are exactly as sensitive as the API
- * key sitting in the same row — storing them in the clear next to an
- * AES-encrypted key would hand anyone who copied the DB a working set of
- * proxy credentials. So it mirrors the key's own storage: ciphertext + iv +
- * auth tag from lib/crypto.ts (AES-256-GCM). All three columns NULL = no
- * per-key override (the API surface spells that as '').
- */
-const COLUMNS = ['proxy_encrypted', 'proxy_iv', 'proxy_auth_tag'] as const;
+const isPostgres = !!process.env.DATABASE_URL;
 
 function hasColumn(db: Db, table: string, column: string): boolean {
+  if (isPostgres) {
+    const row = db.prepare(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = $2
+      ) AS exists`,
+    ).get(table, column) as { exists: boolean } | undefined;
+    return row?.exists ?? false;
+  }
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   return columns.some((candidate) => candidate.name === column);
 }
+
+const COLUMNS = ['proxy_encrypted', 'proxy_iv', 'proxy_auth_tag'] as const;
 
 export function up(db: Db): void {
   for (const column of COLUMNS) {

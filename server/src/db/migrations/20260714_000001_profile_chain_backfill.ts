@@ -1,31 +1,45 @@
 import type { Db } from '../types.js';
 
+const isPostgres = !!process.env.DATABASE_URL;
+
+function pg(sql: string): string {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
 const DOWNGRADE_MARKER_KEY = 'profile_chain_backfill_downgraded';
 
-/**
- * The router prefers the active profile's `profile_models` chain, while the
- * visible Models page historically edited `fallback_config`. New rows added by
- * catalog sync or custom providers were therefore missing from the hidden active
- * profile and never entered auto routing. Backfill every profile with any model
- * rows it lacks, preserving the current fallback_config enabled flag for the
- * initial auto-routing state.
- */
 export function up(db: Db): void {
-  db.prepare('DELETE FROM settings WHERE key = ?').run(DOWNGRADE_MARKER_KEY);
+  const delSql = isPostgres ? pg('DELETE FROM settings WHERE key = ?') : 'DELETE FROM settings WHERE key = ?';
+  db.prepare(delSql).run(DOWNGRADE_MARKER_KEY);
 
   const profiles = db.prepare('SELECT id FROM profiles ORDER BY id ASC').all() as { id: number }[];
   if (profiles.length === 0) return;
 
-  const missing = db.prepare(`
-    SELECT m.id, f.enabled
+  const missingSql = isPostgres
+    ? pg(`SELECT m.id, f.enabled
       FROM fallback_config f
       JOIN models m ON m.id = f.model_db_id
       LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
      WHERE pm.id IS NULL
-     ORDER BY f.priority, m.id
-  `);
-  const maxPriority = db.prepare('SELECT COALESCE(MAX(priority), 0) AS max_priority FROM profile_models WHERE profile_id = ?');
-  const insert = db.prepare('INSERT INTO profile_models (profile_id, model_db_id, priority, enabled) VALUES (?, ?, ?, ?)');
+     ORDER BY f.priority, m.id`)
+    : `SELECT m.id, f.enabled
+      FROM fallback_config f
+      JOIN models m ON m.id = f.model_db_id
+      LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
+     WHERE pm.id IS NULL
+     ORDER BY f.priority, m.id`;
+  const missing = db.prepare(missingSql);
+
+  const maxPrioritySql = isPostgres
+    ? pg('SELECT COALESCE(MAX(priority), 0) AS max_priority FROM profile_models WHERE profile_id = ?')
+    : 'SELECT COALESCE(MAX(priority), 0) AS max_priority FROM profile_models WHERE profile_id = ?';
+  const maxPriority = db.prepare(maxPrioritySql);
+
+  const insertSql = isPostgres
+    ? pg('INSERT INTO profile_models (profile_id, model_db_id, priority, enabled) VALUES (?, ?, ?, ?)')
+    : 'INSERT INTO profile_models (profile_id, model_db_id, priority, enabled) VALUES (?, ?, ?, ?)';
+  const insert = db.prepare(insertSql);
 
   for (const profile of profiles) {
     const rows = missing.all(profile.id) as { id: number; enabled: number }[];
@@ -38,12 +52,12 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  // Removing rows on downgrade would discard user-managed profile order and
-  // enabled state. Older app versions ignore this marker, and the next upgrade
-  // removes it before re-running the backfill.
-  db.prepare(`
-    INSERT INTO settings (key, value)
+  const insertSql = isPostgres
+    ? pg(`INSERT INTO settings (key, value)
+    VALUES (?, ${isPostgres ? 'NOW()::text' : "datetime('now')"})
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    : `INSERT INTO settings (key, value)
     VALUES (?, datetime('now'))
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `).run(DOWNGRADE_MARKER_KEY);
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`;
+  db.prepare(insertSql).run(DOWNGRADE_MARKER_KEY);
 }

@@ -1,15 +1,17 @@
 import type { Db } from '../types.js';
 
-/**
- * Record WHO made each proxied call. All local clients share the single
- * unified API key, so the key can't distinguish callers — the client IP
- * (plus User-Agent for tunneled clients that all arrive as loopback) is the
- * only per-caller signal available to the analytics "Recent calls" view.
- *
- * Guarded like the baseline's column adds: catalog-sync re-runs migrations
- * over a live schema, so ALTERs must be idempotent.
- */
+const isPostgres = !!process.env.DATABASE_URL;
+
 function hasColumn(db: Db, table: string, column: string): boolean {
+  if (isPostgres) {
+    const row = db.prepare(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = $2
+      ) AS exists`,
+    ).get(table, column) as { exists: boolean } | undefined;
+    return row?.exists ?? false;
+  }
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   return columns.some(col => col.name === column);
 }

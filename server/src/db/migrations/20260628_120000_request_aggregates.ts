@@ -1,35 +1,32 @@
 import type { Db } from '../types.js';
 
-/**
- * Roll up request analytics into two durable stores so UI totals stay accurate
- * even after the raw `requests` table is pruned by REQUEST_ANALYTICS_MAX_ROWS.
- *
- *   - `request_hourly`: one row per hour with counts + tokens. Max range the UI
- *     exposes is 30d (~720 rows), but we keep the bucket type "hourly" so the
- *     same data covers 24h and 7d windows too. Pruned at >30d.
- *   - `settings` rows: lifetime totals (total_requests, total_input_tokens,
- *     total_output_tokens, first_request_at) that survive every prune.
- *
- * On upgrade we backfill from the still-present `requests` rows so the hourly
- * table picks up any traffic that landed between the last raw-row prune and
- * this migration. Lifetime counters start counting from "now" — rows pruned
- * before this migration are unrecoverable from the aggregate.
- */
+const isPostgres = !!process.env.DATABASE_URL;
+
+function pg(sql: string): string {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
 function tableExists(db: Db, name: string): boolean {
+  if (isPostgres) {
+    const row = db.prepare(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_name = $1
+      ) AS exists`,
+    ).get(name) as { exists: boolean } | undefined;
+    return row?.exists ?? false;
+  }
   return !!db
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
     .get(name);
 }
 
 function hourKey(createdAt: string): string {
-  // SQLite stores created_at as 'YYYY-MM-DD HH:MM:SS' (UTC). Truncate to hour.
   return createdAt.slice(0, 13) + ':00:00';
 }
 
 export function up(db: Db): void {
-  // Hourly aggregate table. `hour` is the primary key so the same-hour upsert
-  // is a single-row write. We never update tokens on a partial failure, so
-  // success/error counts and token sums stay consistent.
   if (!tableExists(db, 'request_hourly')) {
     db.prepare(`
       CREATE TABLE request_hourly (
@@ -44,11 +41,20 @@ export function up(db: Db): void {
     db.prepare(`CREATE INDEX idx_request_hourly_hour ON request_hourly(hour)`).run();
   }
 
-  // Backfill from any surviving raw rows. This is best-effort: rows pruned
-  // before this migration ran are gone for good from the aggregate, but the
-  // lifetime counters below will still be seeded with current totals.
   if (tableExists(db, 'requests')) {
-    const bucket = db.prepare(`
+    const bucketSql = isPostgres
+      ? pg(`
+      SELECT
+        SUBSTRING(created_at, 1, 13) || ':00:00' AS hour,
+        COUNT(*) AS total_requests,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens
+      FROM requests
+      GROUP BY SUBSTRING(created_at, 1, 13)
+    `)
+      : `
       SELECT
         substr(created_at, 1, 13) || ':00:00' AS hour,
         COUNT(*) AS total_requests,
@@ -58,7 +64,8 @@ export function up(db: Db): void {
         COALESCE(SUM(output_tokens), 0) AS output_tokens
       FROM requests
       GROUP BY substr(created_at, 1, 13)
-    `).all() as Array<{
+    `;
+    const bucket = db.prepare(bucketSql).all() as Array<{
       hour: string;
       total_requests: number;
       success_count: number;
@@ -83,9 +90,6 @@ export function up(db: Db): void {
     });
     tx(bucket);
 
-    // Seed lifetime counters from current raw totals. These are best-effort
-    // since pruned history is unrecoverable, but they at least match the
-    // pre-migration visible total so the UI doesn't reset to 0.
     const totals = db.prepare(`
       SELECT
         COUNT(*) AS total_requests,
@@ -95,10 +99,12 @@ export function up(db: Db): void {
       FROM requests
     `).get() as { total_requests: number; total_input_tokens: number; total_output_tokens: number; first_request_at: string | null };
 
-    const setSetting = db.prepare(`
-      INSERT INTO settings (key, value) VALUES (?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `);
+    const setSettingSql = isPostgres
+      ? pg(`INSERT INTO settings (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      : `INSERT INTO settings (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`;
+    const setSetting = db.prepare(setSettingSql);
     setSetting.run('total_requests', String(totals.total_requests));
     setSetting.run('total_input_tokens', String(totals.total_input_tokens));
     setSetting.run('total_output_tokens', String(totals.total_output_tokens));
@@ -116,5 +122,4 @@ export function down(db: Db): void {
   )`).run();
 }
 
-// Exported so tests can reuse the same bucketing logic.
 export { hourKey };

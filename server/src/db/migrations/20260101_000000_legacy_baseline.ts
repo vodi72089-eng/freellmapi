@@ -4,6 +4,46 @@ import type { Db } from '../types.js';
 import { initEncryptionKey } from '../../lib/crypto.js';
 import { applyModelPricing } from '../model-pricing.js';
 
+const isPostgres = !!process.env.DATABASE_URL;
+
+/** Convert SQLite-style `?` placeholders to PostgreSQL `$1, $2, ...` */
+function pg(sql: string): string {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
+/** Check if a column exists on a table — dual-mode. */
+function hasColumn(db: Db, table: string, column: string): boolean {
+  if (isPostgres) {
+    const row = db.prepare(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = $2
+      ) AS exists`,
+    ).get(table, column) as { exists: boolean } | undefined;
+    return row?.exists ?? false;
+  }
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return columns.some(col => col.name === column);
+}
+
+/** Prepare a statement, converting `?` to `$1,$2,...` and
+ *  `INSERT OR IGNORE` to `INSERT ... ON CONFLICT DO NOTHING` on PostgreSQL. */
+function prepare(db: Db, sql: string) {
+  if (!isPostgres) return db.prepare(sql);
+  let converted = pg(sql);
+  // INSERT OR IGNORE INTO → INSERT INTO ... ON CONFLICT DO NOTHING
+  converted = converted.replace(
+    /INSERT\s+OR\s+IGNORE\s+INTO\s+/i,
+    'INSERT INTO ',
+  );
+  // Append ON CONFLICT DO NOTHING if not already present and the INSERT has no ON CONFLICT
+  if (!/ON\s+CONFLICT/i.test(converted)) {
+    converted = converted.replace(/;?\s*$/, ' ON CONFLICT DO NOTHING;');
+  }
+  return db.prepare(converted);
+}
+
 export function up(db: Db): void {
   createTables(db);
   initEncryptionKey(db);
@@ -56,173 +96,341 @@ export function down(_db: Db): void {
 }
 
 function createTables(db: Db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS models (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      display_name TEXT NOT NULL,
-      intelligence_rank INTEGER NOT NULL,
-      speed_rank INTEGER NOT NULL,
-      size_label TEXT NOT NULL DEFAULT '',
-      rpm_limit INTEGER,
-      rpd_limit INTEGER,
-      tpm_limit INTEGER,
-      tpd_limit INTEGER,
-      monthly_token_budget TEXT NOT NULL DEFAULT '',
-      context_window INTEGER,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      supports_vision INTEGER NOT NULL DEFAULT 0,
-      UNIQUE(platform, model_id)
-    );
+  if (isPostgres) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS models (
+        id SERIAL PRIMARY KEY,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        intelligence_rank INTEGER NOT NULL,
+        speed_rank INTEGER NOT NULL,
+        size_label TEXT NOT NULL DEFAULT '',
+        rpm_limit INTEGER,
+        rpd_limit INTEGER,
+        tpm_limit INTEGER,
+        tpd_limit INTEGER,
+        monthly_token_budget TEXT NOT NULL DEFAULT '',
+        context_window INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        supports_vision INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(platform, model_id)
+      );
 
-    CREATE TABLE IF NOT EXISTS api_keys (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      platform TEXT NOT NULL,
-      label TEXT NOT NULL DEFAULT '',
-      encrypted_key TEXT NOT NULL,
-      iv TEXT NOT NULL,
-      auth_tag TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'unknown',
-      enabled INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      last_checked_at TEXT
-    );
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id SERIAL PRIMARY KEY,
+        platform TEXT NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        encrypted_key TEXT NOT NULL,
+        iv TEXT NOT NULL,
+        auth_tag TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'unknown',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_checked_at TIMESTAMPTZ
+      );
 
-    CREATE TABLE IF NOT EXISTS requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      key_id INTEGER,
-      status TEXT NOT NULL,
-      input_tokens INTEGER NOT NULL DEFAULT 0,
-      output_tokens INTEGER NOT NULL DEFAULT 0,
-      latency_ms INTEGER NOT NULL DEFAULT 0,
-      error TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+      CREATE TABLE IF NOT EXISTS requests (
+        id SERIAL PRIMARY KEY,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        key_id INTEGER,
+        status TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
 
-    CREATE TABLE IF NOT EXISTS rate_limit_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      key_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('request', 'tokens')),
-      tokens INTEGER NOT NULL DEFAULT 0,
-      created_at_ms INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+      CREATE TABLE IF NOT EXISTS rate_limit_usage (
+        id SERIAL PRIMARY KEY,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('request', 'tokens')),
+        tokens INTEGER NOT NULL DEFAULT 0,
+        created_at_ms INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
 
-    CREATE TABLE IF NOT EXISTS rate_limit_cooldowns (
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      key_id INTEGER NOT NULL,
-      expires_at_ms INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (platform, model_id, key_id)
-    );
+      CREATE TABLE IF NOT EXISTS rate_limit_cooldowns (
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (platform, model_id, key_id)
+      );
 
-    CREATE TABLE IF NOT EXISTS fallback_config (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      model_db_id INTEGER NOT NULL REFERENCES models(id),
-      priority INTEGER NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      UNIQUE(model_db_id)
-    );
+      CREATE TABLE IF NOT EXISTS fallback_config (
+        id SERIAL PRIMARY KEY,
+        model_db_id INTEGER NOT NULL REFERENCES models(id),
+        priority INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(model_db_id)
+      );
 
-    CREATE TABLE IF NOT EXISTS profiles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      emoji TEXT NOT NULL DEFAULT '',
-      color TEXT NOT NULL DEFAULT '#6366f1',
-      type TEXT NOT NULL DEFAULT 'custom',
-      is_favorite INTEGER NOT NULL DEFAULT 0,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      auto_sort TEXT,
-      layout_config TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+      CREATE TABLE IF NOT EXISTS profiles (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        emoji TEXT NOT NULL DEFAULT '',
+        color TEXT NOT NULL DEFAULT '#6366f1',
+        type TEXT NOT NULL DEFAULT 'custom',
+        is_favorite INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        auto_sort TEXT,
+        layout_config TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
 
-    CREATE TABLE IF NOT EXISTS profile_models (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-      model_db_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-      priority INTEGER NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      UNIQUE(profile_id, model_db_id)
-    );
+      CREATE TABLE IF NOT EXISTS profile_models (
+        id SERIAL PRIMARY KEY,
+        profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        model_db_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        priority INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(profile_id, model_db_id)
+      );
 
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
 
-    -- Dashboard accounts (email + password) gating the /api/* admin surface (#35).
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
 
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_at_ms INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at_ms INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
-    CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
-    CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
-    CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
-    CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
-    CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
+      CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
+      CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
+      CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
+      CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
+      CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
 
-    CREATE TABLE IF NOT EXISTS provider_quota_state (
-      platform TEXT NOT NULL,
-      key_id INTEGER NOT NULL,
-      quota_pool_key TEXT NOT NULL,
-      metric TEXT NOT NULL,
-      limit_value INTEGER,
-      remaining_value INTEGER,
-      reset_at TEXT,
-      reset_strategy TEXT NOT NULL DEFAULT 'unknown',
-      source TEXT NOT NULL DEFAULT 'probe',
-      confidence REAL NOT NULL DEFAULT 0,
-      notes TEXT,
-      observed_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (platform, key_id, quota_pool_key, metric)
-    );
-    CREATE INDEX IF NOT EXISTS idx_provider_quota_state_platform ON provider_quota_state(platform, key_id, updated_at);
-    CREATE INDEX IF NOT EXISTS idx_provider_quota_state_reset_at ON provider_quota_state(reset_at);
+      CREATE TABLE IF NOT EXISTS provider_quota_state (
+        platform TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        quota_pool_key TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        limit_value INTEGER,
+        remaining_value INTEGER,
+        reset_at TIMESTAMPTZ,
+        reset_strategy TEXT NOT NULL DEFAULT 'unknown',
+        source TEXT NOT NULL DEFAULT 'probe',
+        confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+        notes TEXT,
+        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (platform, key_id, quota_pool_key, metric)
+      );
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_state_platform ON provider_quota_state(platform, key_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_state_reset_at ON provider_quota_state(reset_at);
 
-    CREATE TABLE IF NOT EXISTS provider_quota_observations (
-      id TEXT PRIMARY KEY,
-      platform TEXT NOT NULL,
-      key_id INTEGER NOT NULL,
-      provider_account_id TEXT,
-      model_id TEXT,
-      quota_pool_key TEXT NOT NULL,
-      metric TEXT NOT NULL,
-      status_code INTEGER,
-      limit_value INTEGER,
-      remaining_value INTEGER,
-      reset_at TEXT,
-      retry_after_ms INTEGER,
-      reset_strategy TEXT NOT NULL DEFAULT 'unknown',
-      source TEXT NOT NULL DEFAULT 'probe',
-      confidence REAL NOT NULL DEFAULT 0,
-      notes TEXT,
-      raw_json TEXT,
-      endpoint TEXT,
-      observed_at TEXT NOT NULL DEFAULT (datetime('now')),
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_platform ON provider_quota_observations(platform, key_id, observed_at);
-    CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_reset_at ON provider_quota_observations(reset_at);
-  `);
+      CREATE TABLE IF NOT EXISTS provider_quota_observations (
+        id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        provider_account_id TEXT,
+        model_id TEXT,
+        quota_pool_key TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        status_code INTEGER,
+        limit_value INTEGER,
+        remaining_value INTEGER,
+        reset_at TIMESTAMPTZ,
+        retry_after_ms INTEGER,
+        reset_strategy TEXT NOT NULL DEFAULT 'unknown',
+        source TEXT NOT NULL DEFAULT 'probe',
+        confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+        notes TEXT,
+        raw_json TEXT,
+        endpoint TEXT,
+        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_platform ON provider_quota_observations(platform, key_id, observed_at);
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_reset_at ON provider_quota_observations(reset_at);
+    `);
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        intelligence_rank INTEGER NOT NULL,
+        speed_rank INTEGER NOT NULL,
+        size_label TEXT NOT NULL DEFAULT '',
+        rpm_limit INTEGER,
+        rpd_limit INTEGER,
+        tpm_limit INTEGER,
+        tpd_limit INTEGER,
+        monthly_token_budget TEXT NOT NULL DEFAULT '',
+        context_window INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        supports_vision INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(platform, model_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        encrypted_key TEXT NOT NULL,
+        iv TEXT NOT NULL,
+        auth_tag TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'unknown',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_checked_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        key_id INTEGER,
+        status TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS rate_limit_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('request', 'tokens')),
+        tokens INTEGER NOT NULL DEFAULT 0,
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS rate_limit_cooldowns (
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (platform, model_id, key_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS fallback_config (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_db_id INTEGER NOT NULL REFERENCES models(id),
+        priority INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(model_db_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        emoji TEXT NOT NULL DEFAULT '',
+        color TEXT NOT NULL DEFAULT '#6366f1',
+        type TEXT NOT NULL DEFAULT 'custom',
+        is_favorite INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        auto_sort TEXT,
+        layout_config TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS profile_models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        model_db_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        priority INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(profile_id, model_db_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+      CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
+      CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
+      CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
+      CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
+      CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
+
+      CREATE TABLE IF NOT EXISTS provider_quota_state (
+        platform TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        quota_pool_key TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        limit_value INTEGER,
+        remaining_value INTEGER,
+        reset_at TEXT,
+        reset_strategy TEXT NOT NULL DEFAULT 'unknown',
+        source TEXT NOT NULL DEFAULT 'probe',
+        confidence REAL NOT NULL DEFAULT 0,
+        notes TEXT,
+        observed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (platform, key_id, quota_pool_key, metric)
+      );
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_state_platform ON provider_quota_state(platform, key_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_state_reset_at ON provider_quota_state(reset_at);
+
+      CREATE TABLE IF NOT EXISTS provider_quota_observations (
+        id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
+        provider_account_id TEXT,
+        model_id TEXT,
+        quota_pool_key TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        status_code INTEGER,
+        limit_value INTEGER,
+        remaining_value INTEGER,
+        reset_at TEXT,
+        retry_after_ms INTEGER,
+        reset_strategy TEXT NOT NULL DEFAULT 'unknown',
+        source TEXT NOT NULL DEFAULT 'probe',
+        confidence REAL NOT NULL DEFAULT 0,
+        notes TEXT,
+        raw_json TEXT,
+        endpoint TEXT,
+        observed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_platform ON provider_quota_observations(platform, key_id, observed_at);
+      CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_reset_at ON provider_quota_observations(reset_at);
+    `);
+  }
 
   ensureRequestKeyIdColumn(db);
   ensureApiKeysBaseUrlColumn(db);
@@ -231,53 +439,34 @@ function createTables(db: Db) {
   ensureRequestRequestedModelColumn(db);
 }
 
-// `requested_model` is the model id the CLIENT pinned in the request body.
-// NULL when the request was auto-routed ('auto' or omitted model field).
-// requested_model = model_id means the pin was honored; a different model_id
-// means rate limits or failures forced a failover to another model.
 function ensureRequestRequestedModelColumn(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'requested_model')) {
+  if (!hasColumn(db, 'requests', 'requested_model')) {
     db.prepare('ALTER TABLE requests ADD COLUMN requested_model TEXT').run();
   }
 }
 
-// `ttfb_ms` is the time-to-first-byte for streaming responses (ms from dispatch
-// to the first chunk). NULL for non-streaming or pre-existing rows. Feeds the
-// bandit router's latency axis (server/src/services/scoring.ts).
 function ensureRequestTtfbColumn(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'ttfb_ms')) {
+  if (!hasColumn(db, 'requests', 'ttfb_ms')) {
     db.prepare('ALTER TABLE requests ADD COLUMN ttfb_ms INTEGER').run();
   }
 }
 
 function ensureRequestKeyIdColumn(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'key_id')) {
+  if (!hasColumn(db, 'requests', 'key_id')) {
     db.prepare('ALTER TABLE requests ADD COLUMN key_id INTEGER').run();
   }
   db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_key_id ON requests(key_id)').run();
 }
 
-// `base_url` is the upstream endpoint for the user-configured 'custom' provider
-// (#117). NULL for every built-in platform — they use their hardcoded base URL.
 function ensureApiKeysBaseUrlColumn(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(api_keys)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'base_url')) {
+  if (!hasColumn(db, 'api_keys', 'base_url')) {
     db.prepare('ALTER TABLE api_keys ADD COLUMN base_url TEXT').run();
   }
 }
 
-// `key_id` binds a custom model to the api_keys row that carries ITS endpoint,
-// so several custom providers can coexist (#212). NULL for built-in platforms
-// (any key of the platform serves any of its models).
 function ensureModelsKeyIdColumn(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'key_id')) {
+  if (!hasColumn(db, 'models', 'key_id')) {
     db.prepare('ALTER TABLE models ADD COLUMN key_id INTEGER').run();
-    // Backfill: bind pre-existing custom models to the (single) legacy custom
-    // endpoint key so they keep routing to the URL they were created for.
     db.prepare(`
       UPDATE models
          SET key_id = (SELECT id FROM api_keys WHERE platform = 'custom' ORDER BY id LIMIT 1)
@@ -290,10 +479,12 @@ function seedModels(db: Db) {
   const count = db.prepare('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
   if (count.cnt > 0) return;
 
-  const insert = db.prepare(`
-    INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  const insertSql = isPostgres
+    ? `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+    : `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const insert = db.prepare(insertSql);
 
   // NOTE: Limits current as of April 2026. See migrateModels() for in-place updates.
   const models = [
@@ -344,7 +535,10 @@ function seedModels(db: Db) {
 
   // Seed default fallback config from models
   const allModels = db.prepare('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as { id: number; intelligence_rank: number }[];
-  const insertFallback = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+  const fallbackSql = isPostgres
+    ? 'INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES ($1, $2, 1)'
+    : 'INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)';
+  const insertFallback = db.prepare(fallbackSql);
   const insertFallbacks = db.transaction(() => {
     for (let i = 0; i < allModels.length; i++) {
       insertFallback.run(allModels[i].id, i + 1);
@@ -366,14 +560,20 @@ function migrateModels(db: Db) {
   const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
     // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
   ];
-  const renameStmt = db.prepare(`
-    UPDATE models
-       SET model_id = ?, display_name = ?, intelligence_rank = ?,
-           monthly_token_budget = ?, rpd_limit = COALESCE(?, rpd_limit),
-           context_window = COALESCE(?, context_window),
-           size_label = COALESCE(?, size_label)
-     WHERE platform = ? AND model_id = ?
-  `);
+  const renameSql = isPostgres
+    ? `UPDATE models
+         SET model_id = $1, display_name = $2, intelligence_rank = $3,
+             monthly_token_budget = $4, rpd_limit = COALESCE($5, rpd_limit),
+             context_window = COALESCE($6, context_window),
+             size_label = COALESCE($7, size_label)
+       WHERE platform = $8 AND model_id = $9`
+    : `UPDATE models
+         SET model_id = ?, display_name = ?, intelligence_rank = ?,
+             monthly_token_budget = ?, rpd_limit = COALESCE(?, rpd_limit),
+             context_window = COALESCE(?, context_window),
+             size_label = COALESCE(?, size_label)
+       WHERE platform = ? AND model_id = ?`;
+  const renameStmt = db.prepare(renameSql);
   // DeepSeek R1 (free) -> DeepSeek V3.1 (free)
   renameStmt.run('deepseek/deepseek-v3.1:free', 'DeepSeek V3.1 (free)', 2, '~6M', 200, 131072, 'Frontier', 'openrouter', 'deepseek/deepseek-r1:free');
   // GitHub GPT-4o -> GPT-5
@@ -389,10 +589,13 @@ function migrateModels(db: Db) {
   db.prepare(`UPDATE models SET monthly_token_budget = 'credits-based', enabled = 0 WHERE platform = 'nvidia' AND model_id = 'meta/llama-3.1-70b-instruct'`).run();
 
   // 3) Insert new models (UNIQUE(platform, model_id) makes this idempotent)
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  const insertSql = isPostgres
+    ? `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT DO NOTHING`
+    : `INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const insert = db.prepare(insertSql);
 
   const newModels: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
     // Cerebras — same free pool as qwen3-235b
@@ -425,7 +628,10 @@ function migrateModels(db: Db) {
     `).all() as { id: number }[];
     if (missing.length > 0) {
       const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFallback = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      const addFbSql = isPostgres
+        ? 'INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES ($1, $2, 1)'
+        : 'INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)';
+      const addFallback = db.prepare(addFbSql);
       for (let i = 0; i < missing.length; i++) {
         addFallback.run(missing[i].id, maxPriority + i + 1);
       }
@@ -483,10 +689,12 @@ function migrateModelsV2(db: Db) {
   `).run();
 
   // Add real OpenRouter :free models that exist in the live catalog
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  const insertSql = isPostgres
+    ? pg(`INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
+    : `INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const insert = db.prepare(insertSql);
   const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
     // Frontier-tier free models verified in OR catalog 2026-04
     ['openrouter', 'nvidia/nemotron-3-super-120b-a12b:free', 'Nemotron 3 Super 120B (free)', 2, 9, 'Frontier', 20, 200, null, null, '~6M', 262144],
@@ -612,7 +820,7 @@ function migrateModelsV4(db: Db) {
   db.prepare(`UPDATE models SET rpd_limit = 50, monthly_token_budget = '~6M' WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
 
   // 4) Add live-probed, tool-capable models
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -729,7 +937,7 @@ function migrateModelsV4(db: Db) {
 function migrateModelsV5(db: Db) {
   db.prepare(`UPDATE models SET enabled = 0 WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
 
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -797,7 +1005,7 @@ function migrateModelsV6(db: Db) {
   `).run();
 
   // 3) Add live-probed models
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -863,7 +1071,7 @@ function migrateModelsV7(db: Db) {
   });
   applyRemovals();
 
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -905,7 +1113,7 @@ function migrateModelsV7(db: Db) {
  * access. Cloudflare's @cf/* models share the 10K Neurons/day free pool.
  */
 function migrateModelsV8(db: Db) {
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -962,7 +1170,7 @@ function migrateModelsV9(db: Db) {
  * Free-tier "session" capacity rather than a hard token cap.
  */
 function migrateModelsV10(db: Db) {
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1034,7 +1242,7 @@ function migrateModelsV11(db: Db) {
 
   // 3) Add catalog rows for the four new platforms. Numeric limits are
   //    conservative — provider docs publish best-effort bounds that fluctuate.
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1159,7 +1367,7 @@ function migrateModelsV12(db: Db) {
      WHERE platform = 'openrouter' AND model_id = 'qwen/qwen3-coder:free'
   `).run();
 
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1322,7 +1530,7 @@ function migrateModelsV13(db: Db) {
   db.prepare(`UPDATE models SET context_window = 262144 WHERE platform = 'mistral' AND model_id = 'mistral-large-latest'`).run();
 
   // 7) Additions across providers (chat-probed; tools verified where claimed).
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1431,8 +1639,7 @@ function migrateModelsV15(db: Db) {
 // clear "no vision model" error, while a false positive routes an image to a
 // model that chokes. Idempotent — safe on fresh seeds and upgrades alike.
 function migrateModelsV16Vision(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'supports_vision')) {
+  if (!hasColumn(db, 'models', 'supports_vision')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0').run();
   }
   const apply = db.transaction(() => {
@@ -1589,7 +1796,7 @@ function migrateModelsV17IntelligenceTiers(db: Db) {
 // matching the OpenRouter :free pool pattern. Idempotent (INSERT OR IGNORE +
 // fallback_config backfill), safe to re-run.
 function migrateModelsV18OpenCodeZen(db: Db) {
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1626,7 +1833,7 @@ function migrateModelsV18OpenCodeZen(db: Db) {
  * backfill), safe to re-run.
  */
 function migrateModelsV19Gemma4(db: Db) {
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1655,7 +1862,7 @@ function migrateModelsV19Gemma4(db: Db) {
  * (INSERT OR IGNORE + fallback backfill), safe to re-run.
  */
 function migrateModelsV20KiloFree(db: Db) {
-  const insert = db.prepare(`
+  const insert = prepare(db, `
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -1747,8 +1954,7 @@ function migrateModelsV21PruneDead(db: Db) {
 // pollinations). Idempotent — reset-then-set, safe on fresh seeds and
 // upgrades alike.
 function migrateModelsV22Tools(db: Db) {
-  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'supports_tools')) {
+  if (!hasColumn(db, 'models', 'supports_tools')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
   }
   const apply = db.transaction(() => {
@@ -1849,7 +2055,7 @@ function migrateModelsV23FreeTierAudit(db: Db) {
       db.prepare('DELETE FROM api_keys WHERE platform = ?').run(platform);
     }
 
-    const insert = db.prepare(`
+    const insert = prepare(db, `
       INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
@@ -1899,7 +2105,7 @@ function migrateModelsV23FreeTierAudit(db: Db) {
  */
 function migrateModelsV24ZenRefresh(db: Db) {
   const apply = db.transaction(() => {
-    const insert = db.prepare(`
+    const insert = prepare(db, `
       INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
@@ -1963,30 +2169,47 @@ function migrateModelsV25ZenDeadPromos(db: Db) {
 // (same model served by another provider), never across families.
 // Every entry was live-verified against the provider on 2026-06-04.
 function migrateEmbeddingsV1(db: Db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS embedding_models (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      family TEXT NOT NULL,
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      display_name TEXT NOT NULL,
-      dimensions INTEGER NOT NULL,
-      max_input_tokens INTEGER,
-      priority INTEGER NOT NULL DEFAULT 0,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      quota_label TEXT NOT NULL DEFAULT '',
-      UNIQUE(platform, model_id)
-    );
-  `);
+  if (isPostgres) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS embedding_models (
+        id SERIAL PRIMARY KEY,
+        family TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        max_input_tokens INTEGER,
+        priority INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        quota_label TEXT NOT NULL DEFAULT '',
+        UNIQUE(platform, model_id)
+      );
+    `);
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS embedding_models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        family TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        max_input_tokens INTEGER,
+        priority INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        quota_label TEXT NOT NULL DEFAULT '',
+        UNIQUE(platform, model_id)
+      );
+    `);
+  }
 
   // Tag request rows so embeddings traffic doesn't pollute the chat token
   // budget / headroom math. Existing rows backfill to 'chat' via the default.
-  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'request_type')) {
+  if (!hasColumn(db, 'requests', 'request_type')) {
     db.prepare("ALTER TABLE requests ADD COLUMN request_type TEXT NOT NULL DEFAULT 'chat'").run();
   }
 
-  const seed = db.prepare(`
+  const seed = prepare(db, `
     INSERT OR IGNORE INTO embedding_models
       (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2031,19 +2254,35 @@ function migrateEmbeddingsV1(db: Db) {
  * / 'audio' so it stays out of the chat budget math.
  */
 function migrateMediaV1(db: Db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS media_models (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      display_name TEXT NOT NULL,
-      modality TEXT NOT NULL,
-      priority INTEGER NOT NULL DEFAULT 0,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      quota_label TEXT NOT NULL DEFAULT '',
-      UNIQUE(platform, model_id)
-    );
-  `);
+  if (isPostgres) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS media_models (
+        id SERIAL PRIMARY KEY,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        modality TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        quota_label TEXT NOT NULL DEFAULT '',
+        UNIQUE(platform, model_id)
+      );
+    `);
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS media_models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        modality TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        quota_label TEXT NOT NULL DEFAULT '',
+        UNIQUE(platform, model_id)
+      );
+    `);
+  }
 }
 
 /**
@@ -2073,24 +2312,45 @@ function migrateMediaV1(db: Db) {
  * on next boot while operator-added quirks (new slugs) are left untouched.
  */
 function migrateQuirksV1(db: Db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS quirks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      slug TEXT NOT NULL UNIQUE,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      severity TEXT NOT NULL DEFAULT 'info',
-      created_at_ms INTEGER NOT NULL,
-      updated_at_ms INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS quirk_targets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      quirk_id INTEGER NOT NULL REFERENCES quirks(id) ON DELETE CASCADE,
-      platform TEXT,
-      model_glob TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_quirk_targets_quirk ON quirk_targets(quirk_id);
-  `);
+  if (isPostgres) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS quirks (
+        id SERIAL PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL DEFAULT 'info',
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS quirk_targets (
+        id SERIAL PRIMARY KEY,
+        quirk_id INTEGER NOT NULL REFERENCES quirks(id) ON DELETE CASCADE,
+        platform TEXT,
+        model_glob TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_quirk_targets_quirk ON quirk_targets(quirk_id);
+    `);
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS quirks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL DEFAULT 'info',
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS quirk_targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quirk_id INTEGER NOT NULL REFERENCES quirks(id) ON DELETE CASCADE,
+        platform TEXT,
+        model_glob TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_quirk_targets_quirk ON quirk_targets(quirk_id);
+    `);
+  }
 
   // Superseded curated slugs: removed from the seed below, so the upsert no
   // longer refreshes them — but the old rows would linger as (apparently)
@@ -2193,25 +2453,39 @@ function migrateQuirksV1(db: Db) {
   ];
 
   const now = Date.now();
-  const upsertQuirk = db.prepare(`
-    INSERT INTO quirks (slug, title, body, severity, created_at_ms, updated_at_ms)
-    VALUES (@slug, @title, @body, @severity, @now, @now)
-    ON CONFLICT(slug) DO UPDATE SET
-      title = excluded.title,
-      body = excluded.body,
-      severity = excluded.severity,
-      updated_at_ms = excluded.updated_at_ms
-  `);
-  const getId = db.prepare('SELECT id FROM quirks WHERE slug = ?');
-  const clearTargets = db.prepare('DELETE FROM quirk_targets WHERE quirk_id = ?');
-  const addTarget = db.prepare(
-    'INSERT INTO quirk_targets (quirk_id, platform, model_glob) VALUES (?, ?, ?)',
-  );
+  const upsertQuirkSql = isPostgres
+    ? `INSERT INTO quirks (slug, title, body, severity, created_at_ms, updated_at_ms)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT(slug) DO UPDATE SET
+         title = excluded.title,
+         body = excluded.body,
+         severity = excluded.severity,
+         updated_at_ms = excluded.updated_at_ms`
+    : `INSERT INTO quirks (slug, title, body, severity, created_at_ms, updated_at_ms)
+       VALUES (@slug, @title, @body, @severity, @now, @now)
+       ON CONFLICT(slug) DO UPDATE SET
+         title = excluded.title,
+         body = excluded.body,
+         severity = excluded.severity,
+         updated_at_ms = excluded.updated_at_ms`;
+  const upsertQuirk = db.prepare(upsertQuirkSql);
+  const getIdSql = isPostgres ? pg('SELECT id FROM quirks WHERE slug = ?') : 'SELECT id FROM quirks WHERE slug = ?';
+  const getId = db.prepare(getIdSql);
+  const clearTargetsSql = isPostgres ? pg('DELETE FROM quirk_targets WHERE quirk_id = ?') : 'DELETE FROM quirk_targets WHERE quirk_id = ?';
+  const clearTargets = db.prepare(clearTargetsSql);
+  const addTargetSql = isPostgres
+    ? pg('INSERT INTO quirk_targets (quirk_id, platform, model_glob) VALUES (?, ?, ?)')
+    : 'INSERT INTO quirk_targets (quirk_id, platform, model_glob) VALUES (?, ?, ?)';
+  const addTarget = db.prepare(addTargetSql);
 
   const apply = db.transaction(() => {
     for (const s of seeds) {
-      upsertQuirk.run({ slug: s.slug, title: s.title, body: s.body, severity: s.severity, now });
-      const { id } = getId.get(s.slug) as { id: number };
+      if (isPostgres) {
+        upsertQuirk.run(s.slug, s.title, s.body, s.severity, now, now);
+      } else {
+        upsertQuirk.run({ slug: s.slug, title: s.title, body: s.body, severity: s.severity, now });
+      }
+      const { id } = (isPostgres ? getId.get(s.slug) : getId.get(s.slug)) as { id: number };
       // Reset the curated quirk's selectors so edits in code take effect, but
       // leave quirks/targets with unknown slugs (operator-added) alone.
       clearTargets.run(id);
@@ -2231,7 +2505,10 @@ function backfillFallback(db: Db) {
   `).all() as { id: number }[];
   if (missing.length > 0) {
     const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-    const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+    const addFbSql = isPostgres
+      ? pg('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)')
+      : 'INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)';
+    const addFb = db.prepare(addFbSql);
     for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
   }
 }
@@ -2240,11 +2517,10 @@ function ensureUnifiedKey(db: Db) {
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
   if (!existing) {
     const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
-    db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    // Straight to stdout, deliberately bypassing the console redaction installed
-    // in index.ts: this is the one intentional disclosure of the key, and the
-    // operator needs to copy it to configure a client. Every other path that
-    // echoes a credential is an accident and stays redacted.
+    const insertSql = isPostgres
+      ? pg("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)")
+      : "INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)";
+    db.prepare(insertSql).run(key);
     process.stdout.write(`\n  Your unified API key: ${key}\n\n`);
   }
 }
@@ -2267,23 +2543,28 @@ function migrateProfilesInit(db: Db) {
     const minOrder = (db.prepare('SELECT COALESCE(MIN(sort_order), 0) AS mn FROM profiles').get() as { mn: number }).mn;
     const targetOrder = Math.min(-1, minOrder - 1);
 
-    const result = db.prepare(
-      "INSERT INTO profiles (name, emoji, color, type, sort_order) VALUES ('Default', '⚙️', '#6366f1', 'default', ?)"
-    ).run(targetOrder);
+    const insertProfileSql = isPostgres
+      ? pg("INSERT INTO profiles (name, emoji, color, type, sort_order) VALUES ('Default', '⚙️', '#6366f1', 'default', ?)")
+      : "INSERT INTO profiles (name, emoji, color, type, sort_order) VALUES ('Default', '⚙️', '#6366f1', 'default', ?)";
+    const result = db.prepare(insertProfileSql).run(targetOrder);
 
     const profileId = result.lastInsertRowid as number;
 
     // Seed profile models from fallback_config
-    db.prepare(`
-      INSERT INTO profile_models (profile_id, model_db_id, priority, enabled)
-      SELECT ?, model_db_id, priority, enabled
-      FROM fallback_config
-      ORDER BY priority ASC
-    `).run(profileId);
+    const insertPmSql = isPostgres
+      ? pg(`INSERT INTO profile_models (profile_id, model_db_id, priority, enabled)
+       SELECT ?, model_db_id, priority, enabled
+       FROM fallback_config
+       ORDER BY priority ASC`)
+      : `INSERT INTO profile_models (profile_id, model_db_id, priority, enabled)
+       SELECT ?, model_db_id, priority, enabled
+       FROM fallback_config
+       ORDER BY priority ASC`;
+    db.prepare(insertPmSql).run(profileId);
 
     // Make it the active profile if none is set
     db.prepare(`
-      INSERT INTO settings (key, value) VALUES ('active_profile_id', ?)
+      INSERT INTO settings (key, value) VALUES ('active_profile_id', ${isPostgres ? '$1' : '?'})
       ON CONFLICT(key) DO NOTHING
     `).run(String(profileId));
 

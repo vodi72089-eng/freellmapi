@@ -1,6 +1,22 @@
 import type { Db } from '../types.js';
 
+const isPostgres = !!process.env.DATABASE_URL;
+
+function pg(sql: string): string {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
 function hasColumn(db: Db, table: string, column: string): boolean {
+  if (isPostgres) {
+    const row = db.prepare(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = $2
+      ) AS exists`,
+    ).get(table, column) as { exists: boolean } | undefined;
+    return row?.exists ?? false;
+  }
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   return columns.some(col => col.name === column);
 }
