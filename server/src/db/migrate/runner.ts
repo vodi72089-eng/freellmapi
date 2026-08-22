@@ -32,13 +32,57 @@ interface MigrationRecord {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MIGRATIONS_DIR = path.resolve(__dirname, '../migrations');
 
-const CREATE_MIGRATIONS_TABLE_SQL = `
+function isPostgres(): boolean {
+  return !!process.env.DATABASE_URL;
+}
+
+const CREATE_MIGRATIONS_TABLE_SQLITE = `
   CREATE TABLE IF NOT EXISTS migrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     filename TEXT NOT NULL UNIQUE,
     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
   )
 `;
+
+const CREATE_MIGRATIONS_TABLE_POSTGRES = `
+  CREATE TABLE IF NOT EXISTS migrations (
+    id SERIAL PRIMARY KEY,
+    filename TEXT NOT NULL UNIQUE,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`;
+
+export async function tableExists(db: Db, tableName: string): Promise<boolean> {
+  if (isPostgres()) {
+    const result = await (db as any).queryOne(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_name = $1
+      ) AS exists`,
+      [tableName],
+    );
+    return (result as any)?.exists ?? false;
+  }
+  const row = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+  ).get(tableName) as { name: string } | undefined;
+  return !!row;
+}
+
+export async function columnExists(db: Db, table: string, column: string): Promise<boolean> {
+  if (isPostgres()) {
+    const result = await (db as any).queryOne(
+      `SELECT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_name = $1 AND column_name = $2
+      ) AS exists`,
+      [table, column],
+    );
+    return (result as any)?.exists ?? false;
+  }
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return rows.some(r => r.name === column);
+}
 
 export async function runMigrations(
   db: Db,
@@ -85,9 +129,33 @@ export function getMigrationStatuses(
   db: Db,
   options: MigrationRunnerOptions = {},
 ): MigrationStatus[] {
+  if (isPostgres()) {
+    throw new Error(
+      'Synchronous getMigrationStatuses() is not supported with PostgreSQL. ' +
+      'Use getMigrationStatusesAsync() when DATABASE_URL is set.',
+    );
+  }
+
   initializeMigrationTracking(db);
 
   const applied = getAppliedMigrations(db);
+  return getMigrationRecords(options).map(record => ({
+    filename: record.filename,
+    status: applied.has(record.filename) ? 'applied' : 'pending',
+    appliedAt: applied.get(record.filename) ?? null,
+  }));
+}
+
+export async function getMigrationStatusesAsync(
+  db: Db,
+  options: MigrationRunnerOptions = {},
+): Promise<MigrationStatus[]> {
+  initializeMigrationTracking(db);
+
+  const applied = isPostgres()
+    ? await getAppliedMigrationsAsync(db)
+    : getAppliedMigrations(db);
+
   return getMigrationRecords(options).map(record => ({
     filename: record.filename,
     status: applied.has(record.filename) ? 'applied' : 'pending',
@@ -100,7 +168,11 @@ function initializeMigrationTracking(db: Db): void {
 }
 
 function ensureMigrationsTable(db: Db): void {
-  db.exec(CREATE_MIGRATIONS_TABLE_SQL);
+  if (isPostgres()) {
+    db.exec(CREATE_MIGRATIONS_TABLE_POSTGRES);
+  } else {
+    db.exec(CREATE_MIGRATIONS_TABLE_SQLITE);
+  }
 }
 
 async function runPendingMigrations(
@@ -108,18 +180,32 @@ async function runPendingMigrations(
   records: readonly MigrationRecord[],
   options: MigrationRunnerOptions,
 ): Promise<void> {
-  const applied = getAppliedMigrations(db);
+  const applied = isPostgres()
+    ? await getAppliedMigrationsAsync(db)
+    : getAppliedMigrations(db);
 
   for (const record of records) {
     if (applied.has(record.filename)) continue;
 
     const migration = await loadMigrationModule(record, options);
-    const applyMigration = db.transaction(() => {
-      migration.up(db);
-      db.prepare('INSERT INTO migrations (filename) VALUES (?)').run(record.filename);
-    });
 
-    applyMigration();
+    if (isPostgres()) {
+      const applyMigration = db.transaction(async () => {
+        migration.up(db);
+        await (db as any).query(
+          'INSERT INTO migrations (filename) VALUES ($1)',
+          [record.filename],
+        );
+      });
+      await applyMigration();
+    } else {
+      const applyMigration = db.transaction(() => {
+        migration.up(db);
+        db.prepare('INSERT INTO migrations (filename) VALUES (?)').run(record.filename);
+      });
+      applyMigration();
+    }
+
     applied.set(record.filename, new Date().toISOString());
   }
 }
@@ -129,12 +215,16 @@ async function runLatestDownMigration(
   records: readonly MigrationRecord[],
   options: MigrationRunnerOptions,
 ): Promise<void> {
-  const row = db.prepare(`
-    SELECT filename
-      FROM migrations
-     ORDER BY id DESC
-     LIMIT 1
-  `).get() as { filename: string } | undefined;
+  const row = isPostgres()
+    ? await (db as any).queryOne(
+        `SELECT filename FROM migrations ORDER BY id DESC LIMIT 1`,
+      ) as { filename: string } | undefined
+    : db.prepare(`
+        SELECT filename
+          FROM migrations
+         ORDER BY id DESC
+         LIMIT 1
+      `).get() as { filename: string } | undefined;
 
   if (!row) return;
 
@@ -142,18 +232,36 @@ async function runLatestDownMigration(
   if (!record) throw new Error(`Migration file not found: ${row.filename}`);
 
   const migration = await loadMigrationModule(record, options);
-  const revertMigration = db.transaction(() => {
-    migration.down(db);
-    db.prepare('DELETE FROM migrations WHERE filename = ?').run(row.filename);
-  });
 
-  revertMigration();
+  if (isPostgres()) {
+    const revertMigration = db.transaction(async () => {
+      migration.down(db);
+      await (db as any).query(
+        'DELETE FROM migrations WHERE filename = $1',
+        [row.filename],
+      );
+    });
+    await revertMigration();
+  } else {
+    const revertMigration = db.transaction(() => {
+      migration.down(db);
+      db.prepare('DELETE FROM migrations WHERE filename = ?').run(row.filename);
+    });
+    revertMigration();
+  }
 }
 
 function runPendingMigrationsSync(
   db: Db,
   records: readonly MigrationRecord[],
 ): void {
+  if (isPostgres()) {
+    throw new Error(
+      'Synchronous migration runner is not supported with PostgreSQL. ' +
+      'Use runMigrations() (async) when DATABASE_URL is set.',
+    );
+  }
+
   const applied = getAppliedMigrations(db);
 
   for (const record of records) {
@@ -174,6 +282,13 @@ function runLatestDownMigrationSync(
   db: Db,
   records: readonly MigrationRecord[],
 ): void {
+  if (isPostgres()) {
+    throw new Error(
+      'Synchronous migration runner is not supported with PostgreSQL. ' +
+      'Use runMigrations() (async) when DATABASE_URL is set.',
+    );
+  }
+
   const row = db.prepare(`
     SELECT filename
       FROM migrations
@@ -201,6 +316,13 @@ function getAppliedMigrations(db: Db): Map<string, string> {
      ORDER BY filename ASC
   `).all() as AppliedMigrationRow[];
 
+  return new Map(rows.map(row => [row.filename, row.applied_at]));
+}
+
+async function getAppliedMigrationsAsync(db: Db): Promise<Map<string, string>> {
+  const rows = await (db as any).query(
+    `SELECT filename, applied_at FROM migrations ORDER BY filename ASC`,
+  ) as AppliedMigrationRow[];
   return new Map(rows.map(row => [row.filename, row.applied_at]));
 }
 

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 
 import type { Db } from '../types.js';
 import { connectDb } from '../index.js';
-import { getMigrationStatuses, runMigrations } from './runner.js';
+import { getMigrationStatuses, getMigrationStatusesAsync, runMigrations } from './runner.js';
 
 type Command = 'up' | 'down' | 'fresh' | 'status' | 'create';
 
@@ -35,7 +35,7 @@ async function main(): Promise<void> {
       await runFresh(db);
       return;
     case 'status':
-      printStatus(db);
+      await printStatus(db);
       return;
     default:
       console.error('Usage: tsx src/db/migrate/cli.ts <up|down|fresh|status|create>');
@@ -53,8 +53,10 @@ async function runFresh(db: Db): Promise<void> {
   await runMigrations(db, 'up');
 }
 
-function printStatus(db: Db): void {
-  const statuses = getMigrationStatuses(db);
+async function printStatus(db: Db): Promise<void> {
+  const statuses = process.env.DATABASE_URL
+    ? await getMigrationStatusesAsync(db)
+    : getMigrationStatuses(db);
   console.table(statuses.map(status => ({
     filename: status.filename,
     status: status.status,
