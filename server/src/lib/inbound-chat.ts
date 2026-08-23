@@ -107,12 +107,12 @@ interface ResolvedPin {
   pinnedLabel: string | null;
 }
 
-function resolvePin(model: string | undefined, messages: ChatMessage[], sessionId?: string): ResolvedPin {
+async function resolvePin(model: string | undefined, messages: ChatMessage[], sessionId?: string): Promise<ResolvedPin> {
   const requested = model?.trim();
   const auto = !requested || requested.toLowerCase() === 'auto' || requested.toLowerCase().startsWith('auto:');
   if (auto) {
     return {
-      preferredModel: resolveStickyPreference(getStickyModel(messages, sessionId)),
+      preferredModel: await resolveStickyPreference(getStickyModel(messages, sessionId)),
       pinnedLabel: null,
     };
   }
@@ -123,7 +123,7 @@ function resolvePin(model: string | undefined, messages: ChatMessage[], sessionI
     : null;
   const members = resolved?.memberDbIds ?? null;
   if (members?.length) {
-    const strictChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
+    const strictChain = await resolveModelGroupCandidates(members, resolved!.demotedDbIds);
     if (strictChain.length === 0) {
       const err = new Error(`Model '${requested}' has no enabled provider with a usable key`) as Error & { status?: number; code?: string };
       err.status = 503;
@@ -191,7 +191,7 @@ export async function runInboundChat(
 
   let pin: ResolvedPin;
   try {
-    pin = resolvePin(input.model, input.messages, input.sessionId);
+    pin = await resolvePin(input.model, input.messages, input.sessionId);
   } catch (error: any) {
     wire.sendError(res, error.status ?? 404, error.message, error.code ?? 'model_not_found');
     return;
@@ -230,7 +230,7 @@ export async function runInboundChat(
     state,
     attemptLog,
     clientGone: () => clientGone,
-    route: () => routeRequest(
+    route: async () => routeRequest(
       estimatedTotal,
       state.skipKeys.size ? state.skipKeys : undefined,
       pin.preferredModel,

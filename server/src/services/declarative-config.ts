@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { z } from 'zod';
 import type { Db } from '../db/types.js';
+import { PostgresDb } from '../db/postgres.js';
 import { getDb } from '../db/index.js';
 import { encrypt } from '../lib/crypto.js';
 import { resolveProvider } from '../providers/index.js';
@@ -14,6 +15,8 @@ import {
   upsertModelOverrides,
   type ModelOverridePatch,
 } from './model-state.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 const modelEntrySchema = z.union([
   z.string().min(1),
@@ -153,7 +156,7 @@ function missingKeyWarning(input: z.infer<typeof keySchema>): string | null {
   return `${hint}; entry skipped`;
 }
 
-function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
+function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number | Promise<number> {
   const platform = input.platform.trim();
   const enabled = input.enabled === false ? 0 : 1;
   const isCustom = platform === 'custom';
@@ -167,6 +170,27 @@ function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
 
   if (isCustom) {
     if (!baseUrl) throw new Error('baseUrl is required for custom keys');
+    if (isPostgres) {
+      return (async () => {
+        const existing = await (db as PostgresDb).queryOne(
+          "SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = $1",
+          [baseUrl],
+        ) as { id: number } | undefined;
+        if (existing) {
+          await (db as PostgresDb).execute(
+            `UPDATE api_keys SET label = $1, encrypted_key = $2, iv = $3, auth_tag = $4, enabled = $5, status = 'unknown' WHERE id = $6`,
+            [label, key.encrypted, key.iv, key.authTag, enabled, existing.id],
+          );
+          return existing.id;
+        }
+        const inserted = await (db as PostgresDb).execute(
+          `INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
+           VALUES ('custom', $1, $2, $3, $4, 'unknown', $5, $6) RETURNING id`,
+          [label, key.encrypted, key.iv, key.authTag, enabled, baseUrl],
+        );
+        return (inserted.rows?.[0] as { id: number })?.id ?? 0;
+      })();
+    }
     const existing = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = ?").get(baseUrl) as { id: number } | undefined;
     if (existing) {
       db.prepare(`
@@ -183,6 +207,27 @@ function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
     return Number(inserted.lastInsertRowid);
   }
 
+  if (isPostgres) {
+    return (async () => {
+      const existing = await (db as PostgresDb).queryOne(
+        'SELECT id FROM api_keys WHERE platform = $1 AND label = $2 AND base_url IS NULL LIMIT 1',
+        [platform, label],
+      ) as { id: number } | undefined;
+      if (existing) {
+        await (db as PostgresDb).execute(
+          `UPDATE api_keys SET encrypted_key = $1, iv = $2, auth_tag = $3, enabled = $4, status = 'unknown' WHERE id = $5`,
+          [key.encrypted, key.iv, key.authTag, enabled, existing.id],
+        );
+        return existing.id;
+      }
+      const inserted = await (db as PostgresDb).execute(
+        `INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+         VALUES ($1, $2, $3, $4, $5, 'unknown', $6) RETURNING id`,
+        [platform, label, key.encrypted, key.iv, key.authTag, enabled],
+      );
+      return (inserted.rows?.[0] as { id: number })?.id ?? 0;
+    })();
+  }
   const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? AND label = ? AND base_url IS NULL LIMIT 1')
     .get(platform, label) as { id: number } | undefined;
   if (existing) {

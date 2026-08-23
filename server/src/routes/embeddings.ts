@@ -124,47 +124,32 @@ embeddingsRouter.post('/custom', async (req: Request, res: Response) => {
     return;
   }
 
-  const upsert = db.transaction(() => {
-    // A new secret for a known endpoint is an ADDITIONAL credential, never a
-    // replacement for the stored one (#619).
-    const { keyId, storedKey: storedKeyForMask } = resolveCustomEndpointKey(db, baseUrl, providedKey, label);
-    const { modelDbId } = registerCustomEmbeddingModel(db, {
-      keyId,
-      modelId,
-      displayName: submittedName,
-      family,
-      dimensions,
-      maxInputTokens: parsed.data.maxInputTokens ?? null,
-      quotaLabel,
-    });
-    return { modelDbId, keyId, storedKeyForMask };
+  // A new secret for a known endpoint is an ADDITIONAL credential, never a
+  // replacement for the stored one (#619).
+  const { keyId, storedKey: storedKeyForMask } = resolveCustomEndpointKey(db, baseUrl, providedKey, label);
+  const { modelDbId } = await registerCustomEmbeddingModel(db, {
+    keyId,
+    modelId,
+    displayName: submittedName,
+    family,
+    dimensions,
+    maxInputTokens: parsed.data.maxInputTokens ?? null,
+    quotaLabel,
   });
 
-  // A family-dimension conflict aborts the transaction, so a rejected submit
-  // leaves no half-registered key row behind.
-  let result: { modelDbId: number; keyId: number; storedKeyForMask: string };
-  try {
-    result = upsert();
-  } catch (err: any) {
-    if (err instanceof EmbeddingsError) {
-      res.status(err.status).json({ error: { message: err.message } });
-      return;
-    }
-    throw err;
-  }
   const storedName = (db.prepare('SELECT display_name FROM embedding_models WHERE id = ?')
-    .get(result.modelDbId) as { display_name: string }).display_name;
+    .get(modelDbId) as { display_name: string }).display_name;
   res.status(201).json({
     success: true,
-    keyId: result.keyId,
-    modelDbId: result.modelDbId,
+    keyId,
+    modelDbId,
     platform: 'custom',
     baseUrl,
     model: modelId,
     displayName: storedName,
     family,
     dimensions,
-    maskedKey: maskKey(result.storedKeyForMask),
+    maskedKey: maskKey(storedKeyForMask),
   });
 });
 

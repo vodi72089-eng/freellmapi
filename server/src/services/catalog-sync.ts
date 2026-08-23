@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import type { Db } from '../db/types.js';
+import { PostgresDb } from '../db/postgres.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { hasProvider } from '../providers/index.js';
 import { MEDIA_PLATFORMS, TRANSCRIPTION_PLATFORMS } from './media.js';
@@ -14,6 +15,8 @@ import {
   reinstateUpstreamRetiredCatalogModel,
 } from './model-state.js';
 import { ensureAllModelsInProfiles } from './profile-models.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 // Generative-media modalities are routed into the separate media_models table
 // (see services/media.ts), never into the chat `models` table.
@@ -243,9 +246,11 @@ function routableContextWindow(platform: string, modelId: string, contextWindow:
  *  - models that vanished from the catalog are deleted, exactly like the
  *    dead-model migrations do (fallback_config row first, FK order).
  */
-export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['counts']> {
+export async function applyCatalog(db: Db, catalog: Catalog): Promise<NonNullable<SyncResult['counts']>> {
   const counts = { updated: 0, inserted: 0, removed: 0, skippedUnknownPlatform: 0, quirks: 0 };
 
+  // For PostgreSQL, use direct queries with positional params ($1, $2...).
+  // For SQLite, use prepared statements with named params (@param).
   const selectModel = db.prepare('SELECT id, enabled, source FROM models WHERE platform = ? AND model_id = ?');
   const updateModel = db.prepare(`
     UPDATE models SET
@@ -308,7 +313,15 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
        @priority, @enabled, @quotaLabel)
   `);
 
-  const apply = db.transaction(() => {
+  // For PostgreSQL, use direct queries with positional params
+  const pgSelectModel = async (platform: string, modelId: string) =>
+    (db as PostgresDb).queryOne('SELECT id, enabled, source FROM models WHERE platform = $1 AND model_id = $2', [platform, modelId]) as Promise<{ id: number; enabled: number; source: string } | undefined>;
+  const pgSelectMedia = async (platform: string, modelId: string) =>
+    (db as PostgresDb).queryOne('SELECT id, enabled FROM media_models WHERE platform = $1 AND model_id = $2', [platform, modelId]) as Promise<{ id: number; enabled: number } | undefined>;
+  const pgSelectEmbedding = async (platform: string, modelId: string) =>
+    (db as PostgresDb).queryOne('SELECT id, enabled FROM embedding_models WHERE platform = $1 AND model_id = $2', [platform, modelId]) as Promise<{ id: number; enabled: number } | undefined>;
+
+  const apply = db.transaction(async () => {
     const inCatalog = new Set<string>();
     const inMediaCatalog = new Set<string>();
     const inEmbeddingCatalog = new Set<string>();
@@ -323,7 +336,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
           counts.skippedUnknownPlatform++;
           continue;
         }
-        if (isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
+        if (await isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
         inMediaCatalog.add(`${m.platform}:${m.modelId}`);
         const mrow = selectMedia.get(m.platform, m.modelId) as { id: number; enabled: number } | undefined;
         // Generative-media meta carries only the adapter request flavor today;
@@ -354,11 +367,11 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         counts.skippedUnknownPlatform++;
         continue;
       }
-      if (isCatalogModelTombstoned(db, 'chat', m.platform, m.modelId)) continue;
+      if (await isCatalogModelTombstoned(db, 'chat', m.platform, m.modelId)) continue;
       // A model auto-retired from a 410/end-of-life response (#634) is disabled,
       // not deleted. A catalog that STILL lists it — and lists it enabled — is
       // newer evidence than that one provider response, so lift the retirement.
-      if (m.enabled) reinstateUpstreamRetiredCatalogModel(db, m.platform, m.modelId);
+      if (m.enabled) await reinstateUpstreamRetiredCatalogModel(db, m.platform, m.modelId);
       inCatalog.add(`${m.platform}:${m.modelId}`);
 
       const row = selectModel.get(m.platform, m.modelId) as
@@ -388,11 +401,11 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         // Catalog disable wins (dead upstream); local disable also wins.
         const enabled = m.enabled ? row.enabled : 0;
         updateModel.run({ ...fields, id: row.id, enabled });
-        applyModelOverrides(db, m.platform, m.modelId);
+        await applyModelOverrides(db, m.platform, m.modelId);
         counts.updated++;
       } else {
         insertModel.run({ ...fields, platform: m.platform, modelId: m.modelId, enabled: m.enabled ? 1 : 0 });
-        applyModelOverrides(db, m.platform, m.modelId);
+        await applyModelOverrides(db, m.platform, m.modelId);
         counts.inserted++;
       }
     }
@@ -441,7 +454,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
           counts.skippedUnknownPlatform++;
           continue;
         }
-        if (isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
+        if (await isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
         inTranscriptionCatalog.add(`${m.platform}:${m.modelId}`);
         const meta: Record<string, unknown> = {};
         if (m.subtitleFormats?.length) meta.subtitleFormats = m.subtitleFormats;
@@ -465,8 +478,8 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       }
     }
 
-    counts.removed += deleteTombstonedCatalogModels(db);
-    applyAllModelOverrides(db);
+    counts.removed += await deleteTombstonedCatalogModels(db);
+    await applyAllModelOverrides(db);
 
     // Ensure every model has a fallback_config row (same invariant migrations keep).
     const missingFb = db
@@ -581,7 +594,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
     }
   });
 
-  apply();
+  await apply();
   return counts;
 }
 
@@ -630,7 +643,7 @@ export async function syncCatalog(force = false): Promise<SyncResult> {
 
     const sameAsApplied = applied === catalog.version && getSetting(SETTING_APPLIED_TIER) === catalog.tier;
     if (!sameAsApplied) {
-      const counts = applyCatalog(db, catalog);
+      const counts = await applyCatalog(db, catalog);
       setSetting(SETTING_APPLIED_VERSION, catalog.version);
       setSetting(SETTING_APPLIED_TIER, catalog.tier);
       // Cache the verified document so boots can re-apply it offline (see
@@ -726,7 +739,7 @@ export function getSyncState(): CatalogSyncState {
  * the applied version makes the next poll fetch the full catalog (no `since`
  * short-circuit), which re-applies it and populates the cache.
  */
-export function reapplyCachedCatalog(): { reapplied: boolean; version?: string } {
+export async function reapplyCachedCatalog(): Promise<{ reapplied: boolean; version?: string }> {
   try {
     const raw = getSetting(SETTING_APPLIED_JSON);
     if (!raw) {
@@ -737,7 +750,7 @@ export function reapplyCachedCatalog(): { reapplied: boolean; version?: string }
     }
     const parsed: unknown = JSON.parse(raw);
     if (!isCatalog(parsed) || parsed.version < MIN_CATALOG_VERSION) return { reapplied: false };
-    applyCatalog(getDb(), parsed);
+    await applyCatalog(getDb(), parsed);
     console.log(`[catalog-sync] re-applied cached ${parsed.tier} v${parsed.version} after boot`);
     return { reapplied: true, version: parsed.version };
   } catch (err) {
@@ -755,7 +768,7 @@ export function startCatalogSync(scheduler: Scheduler): void {
     console.log('[catalog-sync] disabled via CATALOG_SYNC_DISABLED=1');
     return;
   }
-  reapplyCachedCatalog();
+  void reapplyCachedCatalog();
   const run = () => {
     void refreshLicenseStatus();
     void syncCatalog();

@@ -1,8 +1,11 @@
 import type { Db } from '../db/types.js';
+import { PostgresDb } from '../db/postgres.js';
 import { resolveCustomEndpointKey, customEndpointKeyIds } from './custom-endpoint.js';
 import { customModelSeed } from './custom-model-seed.js';
 import { ensureModelInProfiles } from './profile-models.js';
 import { endpointScopeForBaseUrl } from '../lib/endpoint-scope.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 // ── Shared custom-model registration ─────────────────────────────────────────
 //
@@ -56,17 +59,17 @@ export interface RegisterCustomModelsResult {
  * the row alone, so the bulk re-registration behind "Fetch models" (which
  * posts bare ids) can't wipe names the operator set.
  */
-export function registerCustomModels(
+export async function registerCustomModels(
   db: Db,
   baseUrl: string,
   providedKey: string | undefined,
   label: string | undefined,
   pinnedKeyId: number | undefined,
   entries: CustomModelEntry[],
-): RegisterCustomModelsResult {
-  return db.transaction(() => {
+): Promise<RegisterCustomModelsResult> {
+  return db.transaction(async () => {
     const { keyId, storedKey } = resolveCustomEndpointKey(db, baseUrl, providedKey, label, pinnedKeyId);
-    const registered = registerCustomChatModels(db, baseUrl, keyId, entries);
+    const registered = await registerCustomChatModels(db, baseUrl, keyId, entries);
     return { keyId, storedKey, registered };
   })();
 }
@@ -77,12 +80,12 @@ export function registerCustomModels(
  * bulk key importer (#382) — which resolves its own key and owns a wider
  * transaction — shares this exact write path instead of keeping a second copy.
  */
-export function registerCustomChatModels(
+export async function registerCustomChatModels(
   db: Db,
   baseUrl: string,
   keyId: number,
   entries: CustomModelEntry[],
-): RegisteredCustomModel[] {
+): Promise<RegisteredCustomModel[]> {
   const endpointKeyIds = customEndpointKeyIds(db, keyId);
   // The identity discriminator for every row registered in this call (#651).
   const endpointScope = endpointScopeForBaseUrl(baseUrl);
@@ -92,9 +95,17 @@ export function registerCustomChatModels(
 
   const registered: RegisteredCustomModel[] = [];
   for (const { modelId, displayName, supportsTools, supportsVision } of entries) {
-    const bound = db.prepare(
-      "SELECT key_id FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
-    ).get(modelId, endpointScope) as { key_id: number | null } | undefined;
+    let bound: { key_id: number | null } | undefined;
+    if (isPostgres) {
+      bound = await (db as PostgresDb).queryOne(
+        "SELECT key_id FROM models WHERE platform = 'custom' AND model_id = $1 AND endpoint_scope = $2",
+        [modelId, endpointScope],
+      ) as typeof bound;
+    } else {
+      bound = db.prepare(
+        "SELECT key_id FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
+      ).get(modelId, endpointScope) as typeof bound;
+    }
     const created = bound === undefined;
     const bindKeyId = bound?.key_id != null && endpointKeyIds.has(bound.key_id) ? bound.key_id : keyId;
     const toolsParam = supportsTools === undefined ? null : (supportsTools ? 1 : 0);
@@ -102,39 +113,77 @@ export function registerCustomChatModels(
     // The seed applies on INSERT only: DO UPDATE deliberately leaves the rank
     // columns alone so re-registering a model (or bulk-adding alongside it)
     // never rewrites ranks the operator has since tuned by hand.
-    db.prepare(`
-      INSERT INTO models
-        (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
-         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
-         supports_tools, supports_vision, source, endpoint_scope)
-      VALUES ('custom', @modelId, COALESCE(@displayName, @modelId), @intelligenceRank, @speedRank, @sizeLabel,
-         NULL, NULL, NULL, NULL, '', NULL, 1, @keyId,
-         COALESCE(@tools, 1), COALESCE(@vision, 0), 'user', @endpointScope)
-      ON CONFLICT(platform, model_id, endpoint_scope)
-      DO UPDATE SET
-        display_name = COALESCE(@displayName, display_name),
-        key_id = excluded.key_id,
-        enabled = 1,
-        supports_tools = COALESCE(@tools, supports_tools),
-        supports_vision = COALESCE(@vision, supports_vision)
-    `).run({
-      modelId, displayName, keyId: bindKeyId, tools: toolsParam, vision: visionParam,
-      intelligenceRank: seed.intelligenceRank, speedRank: seed.speedRank, sizeLabel: seed.sizeLabel,
-      endpointScope,
-    });
+    if (isPostgres) {
+      await (db as PostgresDb).execute(`
+        INSERT INTO models
+          (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+           rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
+           supports_tools, supports_vision, source, endpoint_scope)
+        VALUES ('custom', $1, COALESCE($2, $1), $3, $4, $5,
+           NULL, NULL, NULL, NULL, '', NULL, 1, $6,
+           COALESCE($7, 1), COALESCE($8, 0), 'user', $9)
+        ON CONFLICT(platform, model_id, endpoint_scope)
+        DO UPDATE SET
+          display_name = COALESCE($2, display_name),
+          key_id = excluded.key_id,
+          enabled = 1,
+          supports_tools = COALESCE($7, supports_tools),
+          supports_vision = COALESCE($8, supports_vision)
+      `, [modelId, displayName, seed.intelligenceRank, seed.speedRank, seed.sizeLabel, bindKeyId, toolsParam, visionParam, endpointScope]);
+    } else {
+      db.prepare(`
+        INSERT INTO models
+          (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+           rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
+           supports_tools, supports_vision, source, endpoint_scope)
+        VALUES ('custom', @modelId, COALESCE(@displayName, @modelId), @intelligenceRank, @speedRank, @sizeLabel,
+           NULL, NULL, NULL, NULL, '', NULL, 1, @keyId,
+           COALESCE(@tools, 1), COALESCE(@vision, 0), 'user', @endpointScope)
+        ON CONFLICT(platform, model_id, endpoint_scope)
+        DO UPDATE SET
+          display_name = COALESCE(@displayName, display_name),
+          key_id = excluded.key_id,
+          enabled = 1,
+          supports_tools = COALESCE(@tools, supports_tools),
+          supports_vision = COALESCE(@vision, supports_vision)
+      `).run({
+        modelId, displayName, keyId: bindKeyId, tools: toolsParam, vision: visionParam,
+        intelligenceRank: seed.intelligenceRank, speedRank: seed.speedRank, sizeLabel: seed.sizeLabel,
+        endpointScope,
+      });
+    }
 
     // Read back rather than echo the submitted values: an omitted display name
     // or capability flag resolves in SQL, so the row is the only place that
     // knows what this model is actually called now.
-    const modelRow = db.prepare(
-      "SELECT id, display_name, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
-    ).get(modelId, endpointScope) as { id: number; display_name: string; supports_tools: number; supports_vision: number };
+    let modelRow: { id: number; display_name: string; supports_tools: number; supports_vision: number };
+    if (isPostgres) {
+      modelRow = await (db as PostgresDb).queryOne(
+        "SELECT id, display_name, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = $1 AND endpoint_scope = $2",
+        [modelId, endpointScope],
+      ) as typeof modelRow;
+    } else {
+      modelRow = db.prepare(
+        "SELECT id, display_name, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
+      ).get(modelId, endpointScope) as typeof modelRow;
+    }
 
     // Append to the fallback chain if not already present.
-    const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelRow.id);
+    let inChain: unknown;
+    if (isPostgres) {
+      inChain = await (db as PostgresDb).queryOne('SELECT 1 FROM fallback_config WHERE model_db_id = $1', [modelRow.id]);
+    } else {
+      inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelRow.id);
+    }
     if (!inChain) {
-      const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
-      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
+      let max: { m: number };
+      if (isPostgres) {
+        max = await (db as PostgresDb).queryOne('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config') as { m: number };
+        await (db as PostgresDb).execute('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES ($1, $2, 1)', [modelRow.id, max.m + 1]);
+      } else {
+        max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
+        db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
+      }
     }
     ensureModelInProfiles(db, modelRow.id);
 

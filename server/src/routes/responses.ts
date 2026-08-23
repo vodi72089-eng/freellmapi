@@ -669,13 +669,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   let groupChain: ChainRow[] | undefined;
 
   if (isAutoModel(requestedModelLabel)) {
-    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader));
+    preferredModel = await resolveStickyPreference(getStickyModel(messages, sessionIdHeader));
   } else {
     const db = getDb();
     const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModelLabel, getModelGroups()) : null;
     const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
+      groupChain = await resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
         const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
@@ -768,7 +768,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     attemptLog,
     clientGone: () => clientGone,
     abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
+    route: async () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
     dispatch: async (route, attempt, ctx) => {
       traceRouteEvent('Responses', {
         event: attempt === 0 ? 'start' : 'next',

@@ -8,11 +8,14 @@
 // always works: with one provider it just uses that one, with several it gets
 // cross-provider redundancy for free.
 import { getDb, getSetting } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 import { getClientContext } from '../lib/client-context.js';
 import { decrypt } from '../lib/crypto.js';
 import { proxyFetch } from '../lib/proxy.js';
 import { customEndpointKeyIds } from './custom-endpoint.js';
 import type { Db } from '../db/types.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 export interface EmbeddingModelRow {
   id: number;
@@ -191,14 +194,24 @@ export interface CustomEmbeddingRegistration {
  * at a different dimension: vectors from mismatched spaces must never mix, so
  * the caller has to pick a new family name instead.
  */
-export function registerCustomEmbeddingModel(db: Db, reg: CustomEmbeddingRegistration): { modelDbId: number; created: boolean } {
-  const sibling = db.prepare(`
-    SELECT dimensions
-      FROM embedding_models
-     WHERE family = ?
-       AND NOT (platform = 'custom' AND model_id = ?)
-     LIMIT 1
-  `).get(reg.family, reg.modelId) as { dimensions: number } | undefined;
+export async function registerCustomEmbeddingModel(db: Db, reg: CustomEmbeddingRegistration): Promise<{ modelDbId: number; created: boolean }> {
+  let sibling: { dimensions: number } | undefined;
+  if (isPostgres) {
+    sibling = await (db as PostgresDb).queryOne(
+      `SELECT dimensions FROM embedding_models
+       WHERE family = $1 AND NOT (platform = 'custom' AND model_id = $2)
+       LIMIT 1`,
+      [reg.family, reg.modelId],
+    ) as typeof sibling;
+  } else {
+    sibling = db.prepare(`
+      SELECT dimensions
+        FROM embedding_models
+       WHERE family = ?
+         AND NOT (platform = 'custom' AND model_id = ?)
+       LIMIT 1
+    `).get(reg.family, reg.modelId) as typeof sibling;
+  }
   if (sibling && sibling.dimensions !== reg.dimensions) {
     throw new EmbeddingsError(
       `Embedding family '${reg.family}' is ${sibling.dimensions} dimensions, but '${reg.modelId}' returned ${reg.dimensions}. Use a new family name.`,
@@ -207,41 +220,89 @@ export function registerCustomEmbeddingModel(db: Db, reg: CustomEmbeddingRegistr
   }
 
   const endpointKeyIds = customEndpointKeyIds(db, reg.keyId);
-  const existingModel = db.prepare(`
-    SELECT id, priority, key_id
-      FROM embedding_models
-     WHERE platform = 'custom' AND model_id = ?
-     LIMIT 1
-  `).get(reg.modelId) as { id: number; priority: number; key_id: number | null } | undefined;
+  let existingModel: { id: number; priority: number; key_id: number | null } | undefined;
+  if (isPostgres) {
+    existingModel = await (db as PostgresDb).queryOne(
+      `SELECT id, priority, key_id FROM embedding_models
+       WHERE platform = 'custom' AND model_id = $1
+       LIMIT 1`,
+      [reg.modelId],
+    ) as typeof existingModel;
+  } else {
+    existingModel = db.prepare(`
+      SELECT id, priority, key_id
+        FROM embedding_models
+       WHERE platform = 'custom' AND model_id = ?
+       LIMIT 1
+    `).get(reg.modelId) as typeof existingModel;
+  }
   // A model already on this endpoint keeps the key it has; only a move to a
   // different endpoint re-binds it.
   const bindKeyId = existingModel?.key_id != null && endpointKeyIds.has(existingModel.key_id)
     ? existingModel.key_id
     : reg.keyId;
-  const priority = existingModel?.priority ?? (
-    (db.prepare('SELECT COALESCE(MAX(priority), 0) AS maxPriority FROM embedding_models WHERE family = ?')
-      .get(reg.family) as { maxPriority: number }).maxPriority + 1
-  );
+  let priority: number;
+  if (existingModel) {
+    priority = existingModel.priority;
+  } else {
+    let maxP: { maxPriority: number };
+    if (isPostgres) {
+      maxP = await (db as PostgresDb).queryOne(
+        'SELECT COALESCE(MAX(priority), 0) AS maxPriority FROM embedding_models WHERE family = $1',
+        [reg.family],
+      ) as { maxPriority: number };
+    } else {
+      maxP = db.prepare('SELECT COALESCE(MAX(priority), 0) AS maxPriority FROM embedding_models WHERE family = ?')
+        .get(reg.family) as { maxPriority: number };
+    }
+    priority = maxP.maxPriority + 1;
+  }
 
   // `display_name` is optional: a new model takes its id, and a model already
   // on record keeps the name it has instead of being reset by a submit that
   // simply left the field blank (#704).
   if (existingModel) {
-    db.prepare(`
-      UPDATE embedding_models
-         SET family = ?,
-             display_name = COALESCE(?, display_name),
-             dimensions = ?,
-             max_input_tokens = ?,
-             priority = ?,
-             enabled = 1,
-             quota_label = ?,
-             key_id = ?
-       WHERE id = ?
-    `).run(reg.family, reg.displayName, reg.dimensions, reg.maxInputTokens, priority, reg.quotaLabel, bindKeyId, existingModel.id);
+    if (isPostgres) {
+      await (db as PostgresDb).execute(
+        `UPDATE embedding_models
+           SET family = $1,
+               display_name = COALESCE($2, display_name),
+               dimensions = $3,
+               max_input_tokens = $4,
+               priority = $5,
+               enabled = 1,
+               quota_label = $6,
+               key_id = $7
+         WHERE id = $8`,
+        [reg.family, reg.displayName, reg.dimensions, reg.maxInputTokens, priority, reg.quotaLabel, bindKeyId, existingModel.id],
+      );
+    } else {
+      db.prepare(`
+        UPDATE embedding_models
+           SET family = ?,
+               display_name = COALESCE(?, display_name),
+               dimensions = ?,
+               max_input_tokens = ?,
+               priority = ?,
+               enabled = 1,
+               quota_label = ?,
+               key_id = ?
+         WHERE id = ?
+      `).run(reg.family, reg.displayName, reg.dimensions, reg.maxInputTokens, priority, reg.quotaLabel, bindKeyId, existingModel.id);
+    }
     return { modelDbId: existingModel.id, created: false };
   }
 
+  if (isPostgres) {
+    const model = await (db as PostgresDb).execute(
+      `INSERT INTO embedding_models
+        (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label, key_id)
+       VALUES ($1, 'custom', $2, $3, $4, $5, $6, 1, $7, $8)
+       RETURNING id`,
+      [reg.family, reg.modelId, reg.displayName ?? reg.modelId, reg.dimensions, reg.maxInputTokens, priority, reg.quotaLabel, bindKeyId],
+    );
+    return { modelDbId: (model.rows?.[0] as { id: number })?.id ?? 0, created: true };
+  }
   const model = db.prepare(`
     INSERT INTO embedding_models
       (family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label, key_id)
@@ -328,10 +389,19 @@ function logEmbeddingRequest(
 ): void {
   try {
     const client = getClientContext();
-    getDb().prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type, client_ip, client_user_agent, client_agent)
-      VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'embedding', ?, ?, ?)
-    `).run(row.platform, row.model_id, keyId, status, inputTokens, latencyMs, error, client.ip, client.userAgent, client.agent);
+    const db = getDb();
+    if (isPostgres) {
+      (db as PostgresDb).execute(
+        `INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type, client_ip, client_user_agent, client_agent)
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, 'embedding', $8, $9, $10)`,
+        [row.platform, row.model_id, keyId, status, inputTokens, latencyMs, error, client.ip, client.userAgent, client.agent],
+      );
+    } else {
+      db.prepare(`
+        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type, client_ip, client_user_agent, client_agent)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'embedding', ?, ?, ?)
+      `).run(row.platform, row.model_id, keyId, status, inputTokens, latencyMs, error, client.ip, client.userAgent, client.agent);
+    }
   } catch (e) {
     console.error('Failed to log embedding request:', e);
   }

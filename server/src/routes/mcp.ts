@@ -159,8 +159,8 @@ function usageSummary(args: Record<string, unknown>): unknown {
   };
 }
 
-function routingInfo(): unknown {
-  const scores = getRoutingScores();
+async function routingInfo(): Promise<unknown> {
+  const scores = await getRoutingScores();
   return {
     strategy: scores.strategy,
     top_models: scores.scores
@@ -218,7 +218,7 @@ const TOOLS: Record<string, McpTool> = {
   routing_info: {
     description: 'The active routing strategy and the current top-scored models in the fallback chain.',
     inputSchema: { type: 'object', properties: {} },
-    run: () => routingInfo(),
+    run: async () => routingInfo(),
   },
   set_routing_strategy: {
     description: 'Switch the routing strategy (priority = manual chain order; balanced / smartest / fastest / reliable are scored presets; custom uses the saved weight vector).',

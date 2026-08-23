@@ -237,14 +237,14 @@ function countPersistedRequests(
 ): number | undefined {
   return withDb(db => {
     const row = db.prepare(`
-      SELECT COUNT(*) AS used
-        FROM rate_limit_usage
-       WHERE platform = ?
-         AND model_id = ?
-         AND key_id = ?
-         AND kind = 'request'
-         AND created_at_ms > ?
-    `).get(platform, modelId, keyId, now - windowMs) as { used: number };
+        SELECT COUNT(*) AS used
+          FROM rate_limit_usage
+         WHERE platform = ?
+           AND model_id = ?
+           AND key_id = ?
+           AND kind = 'request'
+           AND created_at_ms > ?
+      `).get(platform, modelId, keyId, now - windowMs) as { used: number };
     return row.used;
   });
 }

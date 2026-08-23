@@ -1,9 +1,12 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 import { FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M } from '../db/model-pricing.js';
 import { providerIdFor, providerDisplayName } from '../lib/provider-identity.js';
 import { normalizeBaseUrl } from '../lib/endpoint-scope.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 export const analyticsRouter = Router();
 
@@ -45,7 +48,7 @@ function getSinceTimestamp(range: string): string {
 // `requests` table is pruned by REQUEST_ANALYTICS_MAX_ROWS, so any analytics
 // count that depends on a >=7d window must read from the hourly table to stay
 // accurate. Hourly resolution is fine for any UI range the dashboard exposes.
-function readAggregateSince(since: string) {
+async function readAggregateSince(since: string) {
   const db = getDb();
   // Hour keys are created_at truncated to the hour, so they share SQLite's
   // canonical 'YYYY-MM-DD HH:00:00' text (space separator). The range cutoff is
@@ -53,17 +56,7 @@ function readAggregateSince(since: string) {
   // directly. No separator conversion: the writer (logRequest) and the timeline
   // reader both compare on the space form, so this must too.
   const aggregateSince = since.slice(0, 13) + ':00:00';
-  const rows = db.prepare(`
-    SELECT
-      COALESCE(SUM(total_requests), 0) as total_requests,
-      COALESCE(SUM(success_count), 0) as success_count,
-      COALESCE(SUM(error_count), 0) as error_count,
-      COALESCE(SUM(input_tokens), 0) as total_input_tokens,
-      COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-      MIN(hour) as first_request_at
-    FROM request_hourly
-    WHERE hour >= ?
-  `).get(aggregateSince) as {
+  let rows: {
     total_requests: number;
     success_count: number;
     error_count: number;
@@ -71,19 +64,51 @@ function readAggregateSince(since: string) {
     total_output_tokens: number;
     first_request_at: string | null;
   };
+  if (isPostgres) {
+    rows = await (db as PostgresDb).queryOne(`
+      SELECT
+        COALESCE(SUM(total_requests), 0) as total_requests,
+        COALESCE(SUM(success_count), 0) as success_count,
+        COALESCE(SUM(error_count), 0) as error_count,
+        COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+        COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+        MIN(hour) as first_request_at
+      FROM request_hourly
+      WHERE hour >= $1
+    `, [aggregateSince]) as typeof rows;
+  } else {
+    rows = db.prepare(`
+      SELECT
+        COALESCE(SUM(total_requests), 0) as total_requests,
+        COALESCE(SUM(success_count), 0) as success_count,
+        COALESCE(SUM(error_count), 0) as error_count,
+        COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+        COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+        MIN(hour) as first_request_at
+      FROM request_hourly
+      WHERE hour >= ?
+    `).get(aggregateSince) as typeof rows;
+  }
   return rows;
 }
 
-function readLifetimeSettings() {
+async function readLifetimeSettings() {
   const db = getDb();
-  const row = db.prepare(`
-    SELECT value FROM settings WHERE key = 'first_request_at'
-  `).get() as { value: string } | undefined;
+  let row: { value: string } | undefined;
+  if (isPostgres) {
+    row = await (db as PostgresDb).queryOne(`
+      SELECT value FROM settings WHERE key = 'first_request_at'
+    `) as { value: string } | undefined;
+  } else {
+    row = db.prepare(`
+      SELECT value FROM settings WHERE key = 'first_request_at'
+    `).get() as { value: string } | undefined;
+  }
   return row?.value ?? null;
 }
 
 // Summary stats
-analyticsRouter.get('/summary', (req: Request, res: Response) => {
+analyticsRouter.get('/summary', async (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
   const since = getSinceTimestamp(range);
   const db = getDb();
@@ -95,7 +120,7 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
   // (platform, model_id); for those we fall back to the raw rows but they're
   // only reported for ranges where recent activity still exists. The aggregate
   // is the source of truth for headline numbers.
-  const aggregate = readAggregateSince(since);
+  const aggregate = await readAggregateSince(since);
   const totalRequests = aggregate.total_requests ?? 0;
   // Success rate over success+error only: a 'canceled' request (#752 — client
   // hung up) still counts in the totals but is neither a success nor a
@@ -105,33 +130,65 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
 
   // Avg latency is only meaningful at the raw row level; the hourly bucket
   // doesn't preserve it. Fall back to a 0/null when no recent raw rows exist.
-  const latencyRow = db.prepare(`
-    SELECT AVG(latency_ms) as avg_latency_ms FROM requests WHERE created_at >= ?
-  `).get(since) as { avg_latency_ms: number | null } | undefined;
+  let latencyRow: { avg_latency_ms: number | null } | undefined;
+  if (isPostgres) {
+    latencyRow = await (db as PostgresDb).queryOne(`
+      SELECT AVG(latency_ms) as avg_latency_ms FROM requests WHERE created_at >= $1
+    `, [since]) as typeof latencyRow;
+  } else {
+    latencyRow = db.prepare(`
+      SELECT AVG(latency_ms) as avg_latency_ms FROM requests WHERE created_at >= ?
+    `).get(since) as typeof latencyRow;
+  }
 
   // Estimated savings is a per-request priced value, so it lives on the raw
   // rows. For ranges where the raw table is empty we report 0 (no recent
   // activity to price).
-  const savings = db.prepare(`
-    SELECT COALESCE(SUM(
-      CASE WHEN r.status = 'success' THEN
-        r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
-        r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
-      ELSE 0 END
-    ), 0) as est_savings
-    FROM requests r
-    LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-    WHERE r.created_at >= ?
-  `).get(FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since) as { est_savings: number };
+  let savings: { est_savings: number };
+  if (isPostgres) {
+    savings = await (db as PostgresDb).queryOne(`
+      SELECT COALESCE(SUM(
+        CASE WHEN r.status = 'success' THEN
+          r.input_tokens  * COALESCE(m.paid_input_per_m,  $1) / 1000000.0 +
+          r.output_tokens * COALESCE(m.paid_output_per_m, $2) / 1000000.0
+        ELSE 0 END
+      ), 0) as est_savings
+      FROM requests r
+      LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
+      WHERE r.created_at >= $3
+    `, [FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since]) as typeof savings;
+  } else {
+    savings = db.prepare(`
+      SELECT COALESCE(SUM(
+        CASE WHEN r.status = 'success' THEN
+          r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
+          r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
+        ELSE 0 END
+      ), 0) as est_savings
+      FROM requests r
+      LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
+      WHERE r.created_at >= ?
+    `).get(FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since) as typeof savings;
+  }
 
   // Pin-honor stats are also raw-row scoped. We still report them when present
   // (typically 24h/7d) and gracefully drop them when the raw window is empty.
-  const pinRow = db.prepare(`
-    SELECT
-      SUM(CASE WHEN requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
-      SUM(CASE WHEN requested_model = model_id THEN 1 ELSE 0 END) as pin_honored_count
-    FROM requests WHERE created_at >= ?
-  `).get(since) as { pinned_count: number | null; pin_honored_count: number | null };
+  let pinRow: { pinned_count: number | null; pin_honored_count: number | null };
+  if (isPostgres) {
+    pinRow = await (db as PostgresDb).queryOne(`
+      SELECT
+        SUM(CASE WHEN requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
+        SUM(CASE WHEN requested_model = model_id THEN 1 ELSE 0 END) as pin_honored_count
+      FROM requests WHERE created_at >= $1
+    `, [since]) as typeof pinRow;
+  } else {
+    pinRow = db.prepare(`
+      SELECT
+        SUM(CASE WHEN requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
+        SUM(CASE WHEN requested_model = model_id THEN 1 ELSE 0 END) as pin_honored_count
+      FROM requests WHERE created_at >= ?
+    `).get(since) as typeof pinRow;
+  }
 
   // Latency percentiles, time-to-first-token, and the chat/embedding split all
   // live on the raw rows (the hourly aggregate keeps neither latency nor a
@@ -143,41 +200,77 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
   // ordered selection so they range over the same set: a NULL sorts first under
   // ORDER BY latency_ms ASC, so if it were counted but not filtered the offset
   // math would shift and a NULL could be selected (rendered as 0).
-  const rawCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM requests WHERE created_at >= ? AND latency_ms IS NOT NULL`
-  ).get(since) as { c: number }).c;
-  const percentileAt = (fraction: number): number | null => {
+  let rawCount: number;
+  if (isPostgres) {
+    const row = await (db as PostgresDb).queryOne(
+      `SELECT COUNT(*) as c FROM requests WHERE created_at >= $1 AND latency_ms IS NOT NULL`,
+      [since]
+    ) as { c: number };
+    rawCount = row.c;
+  } else {
+    rawCount = (db.prepare(
+      `SELECT COUNT(*) as c FROM requests WHERE created_at >= ? AND latency_ms IS NOT NULL`
+    ).get(since) as { c: number }).c;
+  }
+  const percentileAt = async (fraction: number): Promise<number | null> => {
     if (rawCount === 0) return null;
     const offset = Math.floor((rawCount - 1) * fraction);
-    const row = db.prepare(`
-      SELECT latency_ms FROM requests
-      WHERE created_at >= ? AND latency_ms IS NOT NULL
-      ORDER BY latency_ms ASC
-      LIMIT 1 OFFSET ?
-    `).get(since, offset) as { latency_ms: number } | undefined;
-    return row ? Math.round(row.latency_ms) : null;
+    if (isPostgres) {
+      const row = await (db as PostgresDb).queryOne(`
+        SELECT latency_ms FROM requests
+        WHERE created_at >= $1 AND latency_ms IS NOT NULL
+        ORDER BY latency_ms ASC
+        LIMIT 1 OFFSET $2
+      `, [since, offset]) as { latency_ms: number } | undefined;
+      return row ? Math.round(row.latency_ms) : null;
+    } else {
+      const row = db.prepare(`
+        SELECT latency_ms FROM requests
+        WHERE created_at >= ? AND latency_ms IS NOT NULL
+        ORDER BY latency_ms ASC
+        LIMIT 1 OFFSET ?
+      `).get(since, offset) as { latency_ms: number } | undefined;
+      return row ? Math.round(row.latency_ms) : null;
+    }
   };
-  const p50LatencyMs = percentileAt(0.5);
-  const p95LatencyMs = percentileAt(0.95);
+  const p50LatencyMs = await percentileAt(0.5);
+  const p95LatencyMs = await percentileAt(0.95);
 
-  const ttfbRow = db.prepare(`
-    SELECT AVG(ttfb_ms) as avg_ttfb_ms FROM requests
-    WHERE created_at >= ? AND ttfb_ms IS NOT NULL
-  `).get(since) as { avg_ttfb_ms: number | null } | undefined;
+  let ttfbRow: { avg_ttfb_ms: number | null } | undefined;
+  if (isPostgres) {
+    ttfbRow = await (db as PostgresDb).queryOne(`
+      SELECT AVG(ttfb_ms) as avg_ttfb_ms FROM requests
+      WHERE created_at >= $1 AND ttfb_ms IS NOT NULL
+    `, [since]) as typeof ttfbRow;
+  } else {
+    ttfbRow = db.prepare(`
+      SELECT AVG(ttfb_ms) as avg_ttfb_ms FROM requests
+      WHERE created_at >= ? AND ttfb_ms IS NOT NULL
+    `).get(since) as typeof ttfbRow;
+  }
   const avgTtfbMs = ttfbRow?.avg_ttfb_ms != null ? Math.round(ttfbRow.avg_ttfb_ms) : null;
 
-  const typeRows = db.prepare(`
-    SELECT request_type, COUNT(*) as count FROM requests
-    WHERE created_at >= ?
-    GROUP BY request_type
-  `).all(since) as Array<{ request_type: string; count: number }>;
+  let typeRows: Array<{ request_type: string; count: number }>;
+  if (isPostgres) {
+    typeRows = await (db as PostgresDb).query(`
+      SELECT request_type, COUNT(*) as count FROM requests
+      WHERE created_at >= $1
+      GROUP BY request_type
+    `, [since]) as typeof typeRows;
+  } else {
+    typeRows = db.prepare(`
+      SELECT request_type, COUNT(*) as count FROM requests
+      WHERE created_at >= ?
+      GROUP BY request_type
+    `).all(since) as typeof typeRows;
+  }
   const requestTypeCounts = { chat: 0, embedding: 0 };
   for (const row of typeRows) {
     if (row.request_type === 'embedding') requestTypeCounts.embedding = row.count;
     else if (row.request_type === 'chat') requestTypeCounts.chat = row.count;
   }
 
-  const lifetimeFirst = readLifetimeSettings();
+  const lifetimeFirst = await readLifetimeSettings();
 
   res.json({
     totalRequests,

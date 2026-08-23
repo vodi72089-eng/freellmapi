@@ -109,7 +109,7 @@ export function logRequest(
     });
     tx();
 
-    pruneRequestAnalytics({ db });
+    void pruneRequestAnalytics({ db });
   } catch (e) {
     console.error('Failed to log request:', e);
   }

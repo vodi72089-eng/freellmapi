@@ -1,4 +1,5 @@
 import { getDb } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RETENTION_DAYS = 90;
@@ -8,6 +9,8 @@ const PRUNE_INTERVAL_MS = 60_000;
 // ~720 rows for a 30d max UI range. See db/migrations/.../request_aggregates.ts.
 const HOURLY_RETENTION_DAYS = 30;
 const HOURLY_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 type RetentionDb = ReturnType<typeof getDb>;
 
@@ -39,11 +42,11 @@ export function getRequestAnalyticsRetentionConfig(): RequestAnalyticsRetentionC
   };
 }
 
-export function pruneRequestAnalytics(options: {
+export async function pruneRequestAnalytics(options: {
   db?: RetentionDb;
   force?: boolean;
   now?: Date;
-} = {}): { deleted: number; skipped: boolean } {
+} = {}): Promise<{ deleted: number; skipped: boolean }> {
   const now = options.now ?? new Date();
   const nowMs = now.getTime();
 
@@ -58,19 +61,37 @@ export function pruneRequestAnalytics(options: {
 
   if (retentionDays > 0) {
     const cutoff = toSqliteTimestamp(new Date(nowMs - retentionDays * DAY_MS));
-    deleted += db.prepare('DELETE FROM requests WHERE created_at < ?').run(cutoff).changes;
+    if (isPostgres) {
+      const result = await (db as PostgresDb).execute('DELETE FROM requests WHERE created_at < $1', [cutoff]);
+      deleted += result.rowCount;
+    } else {
+      deleted += db.prepare('DELETE FROM requests WHERE created_at < ?').run(cutoff).changes;
+    }
   }
 
   if (maxRows > 0) {
-    deleted += db.prepare(`
-      DELETE FROM requests
-      WHERE id IN (
-        SELECT id
-        FROM requests
-        ORDER BY created_at DESC, id DESC
-        LIMIT -1 OFFSET ?
-      )
-    `).run(maxRows).changes;
+    if (isPostgres) {
+      const result = await (db as PostgresDb).execute(
+        `DELETE FROM requests
+         WHERE id IN (
+           SELECT id FROM requests
+           ORDER BY created_at DESC, id DESC
+           LIMIT ALL OFFSET $1
+         )`,
+        [maxRows],
+      );
+      deleted += result.rowCount;
+    } else {
+      deleted += db.prepare(`
+        DELETE FROM requests
+        WHERE id IN (
+          SELECT id
+          FROM requests
+          ORDER BY created_at DESC, id DESC
+          LIMIT -1 OFFSET ?
+        )
+      `).run(maxRows).changes;
+    }
   }
 
   // Hourly aggregate prune (gated once per day). The UI's widest window is
@@ -81,9 +102,17 @@ export function pruneRequestAnalytics(options: {
   // migration runs would otherwise crash the prune loop).
   if (nowMs >= nextHourlyPruneAtMs) {
     nextHourlyPruneAtMs = nowMs + HOURLY_PRUNE_INTERVAL_MS;
-    const hasHourly = !!db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='request_hourly'")
-      .get();
+    let hasHourly = false;
+    if (isPostgres) {
+      const row = await (db as PostgresDb).queryOne(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'request_hourly'",
+      );
+      hasHourly = !!row;
+    } else {
+      hasHourly = !!db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='request_hourly'")
+        .get();
+    }
     if (hasHourly) {
       // Hour keys are created_at truncated to the hour, in SQLite's canonical
       // 'YYYY-MM-DD HH:00:00' text (space separator) — same as logRequest.hourKey()
@@ -91,9 +120,14 @@ export function pruneRequestAnalytics(options: {
       // compare on the space form so the prune boundary matches the read window.
       const sqliteCutoff = toSqliteTimestamp(new Date(nowMs - HOURLY_RETENTION_DAYS * DAY_MS));
       const hourlyCutoff = sqliteCutoff.slice(0, 13) + ':00:00';
-      const hourlyDeleted = db.prepare('DELETE FROM request_hourly WHERE hour < ?').run(hourlyCutoff).changes;
-      if (hourlyDeleted > 0) {
-        deleted += hourlyDeleted;
+      if (isPostgres) {
+        const result = await (db as PostgresDb).execute('DELETE FROM request_hourly WHERE hour < $1', [hourlyCutoff]);
+        if (result.rowCount > 0) deleted += result.rowCount;
+      } else {
+        const hourlyDeleted = db.prepare('DELETE FROM request_hourly WHERE hour < ?').run(hourlyCutoff).changes;
+        if (hourlyDeleted > 0) {
+          deleted += hourlyDeleted;
+        }
       }
     }
   }

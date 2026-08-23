@@ -1,4 +1,5 @@
 import { getDb } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 import { resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { decryptProxyUrl } from '../lib/key-proxy.js';
@@ -8,6 +9,8 @@ import { inferQuotaPoolKey } from './provider-quota.js';
 import { updateDegradationState } from './degradation.js';
 import type { Scheduler } from '../lib/scheduler.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const CONSECUTIVE_FAILURES_TO_DISABLE = 3;
@@ -65,14 +68,24 @@ function recordInvalidFailure(keyId: number): void {
   failureCount.set(keyId, count);
 
   if (count >= CONSECUTIVE_FAILURES_TO_DISABLE) {
-    getDb().prepare('UPDATE api_keys SET enabled = 0 WHERE id = ?').run(keyId);
+    const db = getDb();
+    if (isPostgres) {
+      (db as PostgresDb).execute('UPDATE api_keys SET enabled = 0 WHERE id = $1', [keyId]);
+    } else {
+      db.prepare('UPDATE api_keys SET enabled = 0 WHERE id = ?').run(keyId);
+    }
     console.log(`[Health] Auto-disabled key ${keyId} after ${count} consecutive failures`);
   }
 }
 
 export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
   const db = getDb();
-  const row = db.prepare('SELECT * FROM api_keys WHERE id = ?').get(keyId) as any;
+  let row: any;
+  if (isPostgres) {
+    row = await (db as PostgresDb).queryOne('SELECT * FROM api_keys WHERE id = $1', [keyId]);
+  } else {
+    row = db.prepare('SELECT * FROM api_keys WHERE id = ?').get(keyId);
+  }
   if (!row) return 'error';
 
   const provider = resolveProvider(row.platform as Platform, row.base_url);
@@ -102,8 +115,15 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
 
     const status: KeyStatus = isValid ? 'healthy' : 'invalid';
 
-    db.prepare("UPDATE api_keys SET status = ?, last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
-      .run(status, lastError, keyId);
+    if (isPostgres) {
+      await (db as PostgresDb).execute(
+        "UPDATE api_keys SET status = $1, last_health_error = $2, last_checked_at = NOW() WHERE id = $3",
+        [status, lastError, keyId],
+      );
+    } else {
+      db.prepare("UPDATE api_keys SET status = ?, last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
+        .run(status, lastError, keyId);
+    }
 
     if (isValid) {
       failureCount.delete(keyId);
@@ -137,8 +157,15 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
     // every key on that provider out of rotation at once. Record the diagnostic
     // and the timestamp; leave the verdict to a probe that actually reached the
     // provider. Confirmed 401/403 (the isValid=false path above) still demotes.
-    db.prepare("UPDATE api_keys SET last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
-      .run(lastError, keyId);
+    if (isPostgres) {
+      await (db as PostgresDb).execute(
+        "UPDATE api_keys SET last_health_error = $1, last_checked_at = NOW() WHERE id = $2",
+        [lastError, keyId],
+      );
+    } else {
+      db.prepare("UPDATE api_keys SET last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
+        .run(lastError, keyId);
+    }
     return row.status as KeyStatus;
   }
 }
@@ -157,7 +184,12 @@ export type KeyProbeOutcome = 'valid' | 'invalid' | 'error';
 export async function probeKeyValidity(keyId: number): Promise<KeyProbeOutcome> {
   try {
     const db = getDb();
-    const row = db.prepare('SELECT * FROM api_keys WHERE id = ? AND enabled = 1').get(keyId) as any;
+    let row: any;
+    if (isPostgres) {
+      row = await (db as PostgresDb).queryOne('SELECT * FROM api_keys WHERE id = $1 AND enabled = 1', [keyId]);
+    } else {
+      row = db.prepare('SELECT * FROM api_keys WHERE id = ? AND enabled = 1').get(keyId);
+    }
     if (!row) return 'error';
 
     const provider = resolveProvider(row.platform as Platform, row.base_url);
@@ -191,9 +223,17 @@ export async function probeKeyValidity(keyId: number): Promise<KeyProbeOutcome> 
  */
 export function markKeyHealthyFromRequest(keyId: number): void {
   try {
-    getDb()
-      .prepare("UPDATE api_keys SET status = 'healthy', last_health_error = NULL WHERE id = ? AND status = 'error'")
-      .run(keyId);
+    const db = getDb();
+    if (isPostgres) {
+      (db as PostgresDb).execute(
+        "UPDATE api_keys SET status = 'healthy', last_health_error = NULL WHERE id = $1 AND status = 'error'",
+        [keyId],
+      );
+    } else {
+      db
+        .prepare("UPDATE api_keys SET status = 'healthy', last_health_error = NULL WHERE id = ? AND status = 'error'")
+        .run(keyId);
+    }
     failureCount.delete(keyId);
   } catch {
     // Never let health bookkeeping break a request that already succeeded.
@@ -292,11 +332,20 @@ async function runHealthPass(opts: HealthPassOptions): Promise<HealthPassResult>
 
   // age_ms comes from the DB clock (last_checked_at is written as
   // datetime('now')); the injected `now` above only drives pacing.
-  const rows = db.prepare(`
-    SELECT id, platform, base_url, status,
-           CAST((julianday('now') - julianday(last_checked_at)) * 86400000 AS INTEGER) AS age_ms
-    FROM api_keys WHERE enabled = 1
-  `).all() as HealthKeyRow[];
+  let rows: HealthKeyRow[];
+  if (isPostgres) {
+    rows = await (db as PostgresDb).query(`
+      SELECT id, platform, base_url, status,
+             CAST(EXTRACT(EPOCH FROM (NOW() - last_checked_at)) * 1000 AS INTEGER) AS age_ms
+      FROM api_keys WHERE enabled = 1
+    `) as HealthKeyRow[];
+  } else {
+    rows = db.prepare(`
+      SELECT id, platform, base_url, status,
+             CAST((julianday('now') - julianday(last_checked_at)) * 86400000 AS INTEGER) AS age_ms
+      FROM api_keys WHERE enabled = 1
+    `).all() as HealthKeyRow[];
+  }
 
   const skippedKeyIds: number[] = [];
   const due = rows.filter(row => {

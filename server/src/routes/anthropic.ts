@@ -532,7 +532,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const rawSession = req.headers['x-claude-code-session-id'] ?? req.headers['x-session-id'];
   const sessionId = Array.isArray(rawSession) ? rawSession[0] : rawSession;
   let preferredModel = resolved.preferredModelDbId;
-  if (preferredModel == null) preferredModel = resolveStickyPreference(getStickyModel(messages, sessionId));
+  if (preferredModel == null) preferredModel = await resolveStickyPreference(getStickyModel(messages, sessionId));
 
   // Thin adapter over the shared fallback loop (lib/fallback-loop.ts): the
   // cooldown/skip/penalty/exhaustion machinery is shared, only the Anthropic
@@ -569,7 +569,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     attemptLog,
     clientGone: () => clientGone,
     abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, undefined, false, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
+    route: async () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, undefined, false, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
     dispatch: async (route, attempt, dispatchCtx) => {
       if (stream) {
         try {
