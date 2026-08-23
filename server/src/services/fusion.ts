@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { ChatMessage, ChatCompletionChoice, ChatCompletionResponse, ChatToolCall, TokenUsage } from '@freellmapi/shared/types.js';
 import {
-  routePinnedModel, routeRequest, getOrderedFusionChain, resolveFusionCandidate,
+  routePinnedModel, routeRequest, getOrderedFusionChain, resolveFusionCandidate, resolveFusionCandidateAsync,
   recordRateLimitHit, recordSuccess, type RouteResult, type FusionCandidate,
 } from './router.js';
 import {
@@ -215,7 +215,7 @@ function addUsage(a: TokenUsage, b: TokenUsage | undefined): TokenUsage {
  * substitutes), or the auto-router for the judge (falls over across the chain).
  */
 async function runModelCall(
-  getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => RouteResult | null,
+  getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => Promise<RouteResult | null> | RouteResult | null,
   messages: ChatMessage[],
   options: CompletionOptions,
   estimatedTokens: number,
@@ -228,7 +228,7 @@ async function runModelCall(
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let route: RouteResult | null;
     try {
-      route = getRoute(skipKeys, skipModels);
+      route = await getRoute(skipKeys, skipModels);
     } catch (err: any) {
       // routeRequest throws when the whole chain is exhausted (judge path).
       lastError = sanitizeProviderErrorMessage(err?.message);
@@ -308,7 +308,7 @@ async function runModelCall(
  * Usage is estimated (streaming rarely echoes a usage block).
  */
 async function runJudgeStreaming(
-  getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => RouteResult | null,
+  getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => Promise<RouteResult | null> | RouteResult | null,
   messages: ChatMessage[],
   options: CompletionOptions,
   estimatedTokens: number,
@@ -321,7 +321,7 @@ async function runJudgeStreaming(
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let route: RouteResult | null;
-    try { route = getRoute(skipKeys, skipModels); } catch (err: any) { lastError = sanitizeProviderErrorMessage(err?.message); break; }
+    try { route = await getRoute(skipKeys, skipModels); } catch (err: any) { lastError = sanitizeProviderErrorMessage(err?.message); break; }
     if (!route) break;
 
     const startedAt = Date.now();
@@ -446,7 +446,7 @@ export function diversifyChain(ordered: FusionCandidate[]): FusionCandidate[] {
  * both the panel and its refills span genuinely different perspectives before
  * doubling up on either axis.
  */
-export function selectPanel(config: FusionConfig, requirements: { requireTools?: boolean; requireVision?: boolean; estimatedTokens: number }): { panel: FusionCandidate[]; overflow: FusionCandidate[]; dropped: string[] } {
+export async function selectPanel(config: FusionConfig, requirements: { requireTools?: boolean; requireVision?: boolean; estimatedTokens: number }): Promise<{ panel: FusionCandidate[]; overflow: FusionCandidate[]; dropped: string[] }> {
   const maxK = panelMaxK();
 
   if (config.models && config.models.length > 0) {
@@ -455,7 +455,7 @@ export function selectPanel(config: FusionConfig, requirements: { requireTools?:
     const seen = new Set<number>();
     for (const id of config.models) {
       if (panel.length >= maxK) { dropped.push(`${id} (over cap of ${maxK})`); continue; }
-      const cand = resolveFusionCandidate(id);
+      const cand = await resolveFusionCandidateAsync(id);
       if (!cand) { dropped.push(`${id} (unknown or disabled)`); continue; }
       if (requirements.requireTools && !cand.supportsTools) { dropped.push(`${id} (no tool-calling support)`); continue; }
       if (requirements.requireVision && !cand.supportsVision) { dropped.push(`${id} (no vision support)`); continue; }
@@ -470,7 +470,7 @@ export function selectPanel(config: FusionConfig, requirements: { requireTools?:
   const k = Math.min(Math.max(config.k ?? panelDefaultK(), 1), maxK);
   // Size-aware: the chain excludes models that cannot hold a prompt this large,
   // so a too-small model never claims a slot it is guaranteed to fail.
-  const ordered = getOrderedFusionChain(requirements.estimatedTokens)
+  const ordered = (await getOrderedFusionChain(requirements.estimatedTokens))
     .filter(c => !requirements.requireTools || c.supportsTools)
     .filter(c => !requirements.requireVision || c.supportsVision);
 
@@ -564,7 +564,7 @@ export async function runFusion(params: {
   const strategy = config.strategy ?? 'synthesize';
 
   const requireTools = (options.tools?.length ?? 0) > 0;
-  const { panel, overflow, dropped } = selectPanel(config, { requireTools, requireVision: vision, estimatedTokens });
+  const { panel, overflow, dropped } = await selectPanel(config, { requireTools, requireVision: vision, estimatedTokens });
   if (panel.length === 0) {
     const hint = vision
       ? 'No vision-capable model is servable for the panel. Enable a vision model in the Fallback Chain or pass `fusion.models` with vision-capable model ids.'
@@ -710,8 +710,8 @@ export async function runFusion(params: {
       : options;
 
     const getJudgeRoute = config.judge
-      ? (skipKeys: Set<string>) => {
-          const cand = resolveFusionCandidate(config.judge!);
+      ? async (skipKeys: Set<string>) => {
+          const cand = await resolveFusionCandidateAsync(config.judge!);
           return cand ? routePinnedModel(cand.modelDbId, judgeEstimate, skipKeys) : null;
         }
       : (skipKeys: Set<string>, skipModels: Set<number>) => routeRequest(

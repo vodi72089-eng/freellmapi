@@ -101,8 +101,8 @@ export async function runCustomModelSync(db: Db): Promise<CustomModelSyncResult>
       }
 
       if (fresh.length > 0) {
-        const registered = registerCustomModels(db, endpoint.baseUrl, undefined, undefined, endpoint.keyId, fresh);
-        result.added += registered.registered.filter(m => m.created).length;
+        const registered = await registerCustomModels(db, endpoint.baseUrl, undefined, undefined, endpoint.keyId, fresh);
+        result.added += registered.registered.filter((m: { created?: boolean }) => m.created).length;
       }
     } catch (err: any) {
       const message = err?.message ?? String(err);

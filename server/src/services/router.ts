@@ -1,7 +1,10 @@
 import { getDb, getSetting, setSetting } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 import { getProvider, hasProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { decryptProxyUrl } from '../lib/key-proxy.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 import {
   canMakeRequest,
   canUseTokens,
@@ -577,13 +580,18 @@ const IS_TIMEOUT_SQL = `(status != 'success' AND (${
 }))`;
 
 /** api_keys.id → endpoint scope, for every custom credential on record (#651). */
-function customEndpointScopes(db: Db): Map<number, string> {
-  const rows = db.prepare("SELECT id, base_url FROM api_keys WHERE platform = 'custom'")
-    .all() as { id: number; base_url: string | null }[];
+async function customEndpointScopes(db: Db): Promise<Map<number, string>> {
+  let rows: { id: number; base_url: string | null }[];
+  if (isPostgres) {
+    rows = await (db as PostgresDb).query("SELECT id, base_url FROM api_keys WHERE platform = 'custom'") as typeof rows;
+  } else {
+    rows = db.prepare("SELECT id, base_url FROM api_keys WHERE platform = 'custom'")
+      .all() as typeof rows;
+  }
   return new Map(rows.map(r => [r.id, endpointScopeForBaseUrl(r.base_url)]));
 }
 
-export function refreshStatsCache(db: Db, force = false): void {
+export async function refreshStatsCache(db: Db, force = false): Promise<void> {
   if (!force && statsCache && Date.now() - statsCacheTime < CACHE_TTL_MS) return;
 
   // Re-read the community priors alongside the stats they season, so a forced
@@ -595,25 +603,44 @@ export function refreshStatsCache(db: Db, force = false): void {
   // count × ≤7 day buckets — so the finer grain keeps the same one-query,
   // 60s-cached shape. Aggregated two ways below: rolled up per model (ordering)
   // and per key (in-model key selection, #580).
-  const buckets = db.prepare(`
-    SELECT platform, model_id, key_id,
-      CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
-      COUNT(*) AS total,
-      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
-      SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END) AS succ_out,
-      SUM(CASE WHEN status = 'success' THEN latency_ms ELSE 0 END) AS succ_lat,
-      SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN ttfb_ms ELSE 0 END) AS succ_ttfb_sum,
-      SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt,
-      SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN 1 ELSE 0 END) AS timeouts,
-      SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN MIN(MAX(latency_ms, 0), ${TIMEOUT_LATENCY_CAP_MS}) ELSE 0 END) AS timeout_lat
-    FROM requests
-    WHERE created_at >= ? AND status <> 'canceled'
-    GROUP BY platform, model_id, key_id, age_days
-  `).all(since) as Array<{
+  let buckets: Array<{
     platform: string; model_id: string; key_id: number | null; age_days: number; total: number; successes: number;
     succ_out: number; succ_lat: number; succ_ttfb_sum: number; succ_ttfb_cnt: number;
     timeouts: number; timeout_lat: number;
   }>;
+  if (isPostgres) {
+    buckets = await (db as PostgresDb).query(`
+      SELECT platform, model_id, key_id,
+        CAST(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400 AS INTEGER) AS age_days,
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+        SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END) AS succ_out,
+        SUM(CASE WHEN status = 'success' THEN latency_ms ELSE 0 END) AS succ_lat,
+        SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN ttfb_ms ELSE 0 END) AS succ_ttfb_sum,
+        SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt,
+        SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN 1 ELSE 0 END) AS timeouts,
+        SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN GREATEST(LEAST(latency_ms, 0), ${TIMEOUT_LATENCY_CAP_MS}) ELSE 0 END) AS timeout_lat
+      FROM requests
+      WHERE created_at >= $1 AND status <> 'canceled'
+      GROUP BY platform, model_id, key_id, age_days
+    `, [since]) as typeof buckets;
+  } else {
+    buckets = db.prepare(`
+      SELECT platform, model_id, key_id,
+        CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+        SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END) AS succ_out,
+        SUM(CASE WHEN status = 'success' THEN latency_ms ELSE 0 END) AS succ_lat,
+        SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN ttfb_ms ELSE 0 END) AS succ_ttfb_sum,
+        SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt,
+        SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN 1 ELSE 0 END) AS timeouts,
+        SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN MIN(MAX(latency_ms, 0), ${TIMEOUT_LATENCY_CAP_MS}) ELSE 0 END) AS timeout_lat
+      FROM requests
+      WHERE created_at >= ? AND status <> 'canceled'
+      GROUP BY platform, model_id, key_id, age_days
+    `).all(since) as typeof buckets;
+  }
 
   // Accumulate decay-weighted sums per model AND per key.
   //
@@ -640,7 +667,7 @@ export function refreshStatsCache(db: Db, force = false): void {
   // `requests` has always recorded key_id, so pre-migration history splits
   // correctly too; rows whose key is gone (or that never had one) fall into the
   // un-scoped bucket, which only un-scoped rows read.
-  const scopeByKeyId = customEndpointScopes(db);
+  const scopeByKeyId = await customEndpointScopes(db);
   const scopeOf = (platform: string, keyId: number | null): string =>
     platform === 'custom' && keyId != null ? (scopeByKeyId.get(keyId) ?? '') : '';
 
@@ -661,13 +688,24 @@ export function refreshStatsCache(db: Db, force = false): void {
   }
 
   // Calendar-month token usage per model, for the headroom guardrail.
-  const usageRows = db.prepare(`
-    SELECT platform, model_id, key_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
-    FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
-      AND request_type = 'chat'
-    GROUP BY platform, model_id, key_id
-  `).all() as Array<{ platform: string; model_id: string; key_id: number | null; used: number }>;
+  let usageRows: Array<{ platform: string; model_id: string; key_id: number | null; used: number }>;
+  if (isPostgres) {
+    usageRows = await (db as PostgresDb).query(`
+      SELECT platform, model_id, key_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
+      FROM requests
+      WHERE created_at >= DATE_TRUNC('month', NOW())
+        AND request_type = 'chat'
+      GROUP BY platform, model_id, key_id
+    `) as typeof usageRows;
+  } else {
+    usageRows = db.prepare(`
+      SELECT platform, model_id, key_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
+      FROM requests
+      WHERE created_at >= datetime('now', 'start of month')
+        AND request_type = 'chat'
+      GROUP BY platform, model_id, key_id
+    `).all() as typeof usageRows;
+  }
   const usageMap = new Map<string, number>();
   for (const r of usageRows) {
     const key = modelStatsKey(r.platform, r.model_id, scopeOf(r.platform, r.key_id));
@@ -754,31 +792,49 @@ export function resetSpeedRankWriteback(): void {
  * Reads the stats cache as-is — callers refresh it first (refreshStatsCache
  * calls this from its own tail).
  */
-export function writeObservedSpeedRanks(db: Db): number {
+export async function writeObservedSpeedRanks(db: Db): Promise<number> {
   if (!statsCache || statsCache.size === 0) return 0;
 
-  const pinned = modelsWithOverriddenField(db, 'speedRank');
-  const rows = db.prepare('SELECT id, platform, model_id, speed_rank, endpoint_scope FROM models')
-    .all() as { id: number; platform: string; model_id: string; speed_rank: number; endpoint_scope: string }[];
+  const pinned = await modelsWithOverriddenField(db, 'speedRank');
+  let rows: { id: number; platform: string; model_id: string; speed_rank: number; endpoint_scope: string }[];
+  if (isPostgres) {
+    rows = await (db as PostgresDb).query(
+      'SELECT id, platform, model_id, speed_rank, endpoint_scope FROM models',
+    ) as typeof rows;
+  } else {
+    rows = db.prepare('SELECT id, platform, model_id, speed_rank, endpoint_scope FROM models')
+      .all() as typeof rows;
+  }
 
-  const update = db.prepare('UPDATE models SET speed_rank = ? WHERE id = ?');
   let written = 0;
-  const tx = db.transaction(() => {
-    for (const row of rows) {
-      // Overrides are keyed (platform, model_id) — they only exist for
-      // catalog-managed rows, which are never endpoint-scoped — while the
-      // measured stats are per endpoint, so each relay's copy gets its own
-      // observed rank instead of one shared number (#651).
-      if (pinned.has(`${row.platform}:${row.model_id}`)) continue;
-      const stats = statsCache!.get(modelStatsKey(row.platform, row.model_id, row.endpoint_scope));
-      if (!stats || stats.speedSamples < SPEED_RANK_MIN_SAMPLES) continue;
-      const rank = observedSpeedRank(speedScore(stats.tokPerSec, stats.avgTtfbMs));
-      if (rank === row.speed_rank) continue;
-      update.run(rank, row.id);
-      written++;
-    }
-  });
-  tx();
+  if (isPostgres) {
+    const tx = (db as PostgresDb).transaction;
+    await tx(async () => {
+      for (const row of rows) {
+        if (pinned.has(`${row.platform}:${row.model_id}`)) continue;
+        const stats = statsCache!.get(modelStatsKey(row.platform, row.model_id, row.endpoint_scope));
+        if (!stats || stats.speedSamples < SPEED_RANK_MIN_SAMPLES) continue;
+        const rank = observedSpeedRank(speedScore(stats.tokPerSec, stats.avgTtfbMs));
+        if (rank === row.speed_rank) continue;
+        await (db as PostgresDb).execute('UPDATE models SET speed_rank = $1 WHERE id = $2', [rank, row.id]);
+        written++;
+      }
+    })();
+  } else {
+    const update = db.prepare('UPDATE models SET speed_rank = ? WHERE id = ?');
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        if (pinned.has(`${row.platform}:${row.model_id}`)) continue;
+        const stats = statsCache!.get(modelStatsKey(row.platform, row.model_id, row.endpoint_scope));
+        if (!stats || stats.speedSamples < SPEED_RANK_MIN_SAMPLES) continue;
+        const rank = observedSpeedRank(speedScore(stats.tokPerSec, stats.avgTtfbMs));
+        if (rank === row.speed_rank) continue;
+        update.run(rank, row.id);
+        written++;
+      }
+    });
+    tx();
+  }
   return written;
 }
 
@@ -801,10 +857,17 @@ interface ScoredEntry {
 // capacity. `monthlyUsedTokens` is already summed across all keys, so budget
 // must scale to match or the headroom guardrail damps a multi-key model to the
 // floor after just one account's worth of tokens.
-function usableKeyCountsByPlatform(db: Db): Map<string, number> {
-  const rows = db.prepare(
-    "SELECT platform, COUNT(*) AS count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform"
-  ).all() as { platform: string; count: number }[];
+async function usableKeyCountsByPlatform(db: Db): Promise<Map<string, number>> {
+  let rows: { platform: string; count: number }[];
+  if (isPostgres) {
+    rows = await (db as PostgresDb).query(
+      "SELECT platform, COUNT(*) AS count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform",
+    ) as typeof rows;
+  } else {
+    rows = db.prepare(
+      "SELECT platform, COUNT(*) AS count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform",
+    ).all() as typeof rows;
+  }
   return new Map(rows.map(r => [r.platform, r.count]));
 }
 
@@ -864,7 +927,7 @@ function scoreChainEntry(
  * faithful reflection of the user's picked strategy, not a re-sampled draw each
  * request. Priority mode is deterministic either way.
  */
-function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true): ChainRow[] {
+async function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true): Promise<ChainRow[]> {
   // Tier first, always: it is the one ordering input that score must not be able
   // to override (see ChainRow.match_tier). Zero for every chain built anywhere
   // else, so this is a no-op outside slug-fallback resolution.
@@ -909,7 +972,7 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
   const composites = chain.map(e => intelligenceComposite(e.size_label, e.intelligence_rank));
   const intelMin = composites.length ? Math.min(...composites) : 0;
   const intelMax = composites.length ? Math.max(...composites) : 0;
-  const keyCounts = usableKeyCountsByPlatform(getDb());
+  const keyCounts = await usableKeyCountsByPlatform(getDb());
 
   return chain
     .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts).score }))
@@ -949,24 +1012,50 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
   balanced: 'balanced',
 };
 
-function getActiveChain(db: Db): ChainRow[] {
+async function getActiveChain(db: Db): Promise<ChainRow[]> {
   const profileId = getActiveProfileId(db);
   if (profileId != null) {
-    const chain = db.prepare(`
-      SELECT pm.model_db_id, pm.priority, pm.enabled,
+    let chain: ChainRow[];
+    if (isPostgres) {
+      chain = await (db as PostgresDb).query(`
+        SELECT pm.model_db_id, pm.priority, pm.enabled,
+               m.platform, m.model_id, m.display_name, m.intelligence_rank,
+               m.size_label, m.monthly_token_budget,
+               m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+               m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+        FROM profile_models pm
+        JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+        WHERE pm.profile_id = $1
+        ORDER BY pm.priority ASC
+      `, [profileId]) as ChainRow[];
+    } else {
+      chain = db.prepare(`
+        SELECT pm.model_db_id, pm.priority, pm.enabled,
+               m.platform, m.model_id, m.display_name, m.intelligence_rank,
+               m.size_label, m.monthly_token_budget,
+               m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+               m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+        FROM profile_models pm
+        JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+        WHERE pm.profile_id = ?
+        ORDER BY pm.priority ASC
+      `).all(profileId) as ChainRow[];
+    }
+    if (chain.length > 0) return chain;
+  }
+
+  if (isPostgres) {
+    return (db as PostgresDb).query(`
+      SELECT fc.model_db_id, fc.priority, fc.enabled,
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
              m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
-      FROM profile_models pm
-      JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
-      WHERE pm.profile_id = ?
-      ORDER BY pm.priority ASC
-    `).all(profileId) as ChainRow[];
-    
-    if (chain.length > 0) return chain;
+      FROM fallback_config fc
+      JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+      ORDER BY fc.priority ASC
+    `) as Promise<ChainRow[]>;
   }
-
   return db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -979,10 +1068,31 @@ function getActiveChain(db: Db): ChainRow[] {
   `).all() as ChainRow[];
 }
 
-function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
-  const profile = db.prepare("SELECT id FROM profiles WHERE LOWER(name) = ?").get(name.toLowerCase()) as { id: number } | undefined;
+async function getChainByProfileName(db: Db, name: string): Promise<ChainRow[] | null> {
+  let profile: { id: number } | undefined;
+  if (isPostgres) {
+    profile = await (db as PostgresDb).queryOne(
+      'SELECT id FROM profiles WHERE LOWER(name) = $1',
+      [name.toLowerCase()],
+    ) as typeof profile;
+  } else {
+    profile = db.prepare("SELECT id FROM profiles WHERE LOWER(name) = ?").get(name.toLowerCase()) as typeof profile;
+  }
   if (!profile) return null;
 
+  if (isPostgres) {
+    return (db as PostgresDb).query(`
+      SELECT pm.model_db_id, pm.priority, pm.enabled,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+      FROM profile_models pm
+      JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+      WHERE pm.profile_id = $1
+      ORDER BY pm.priority ASC
+    `, [profile.id]) as Promise<ChainRow[]>;
+  }
   return db.prepare(`
     SELECT pm.model_db_id, pm.priority, pm.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -996,7 +1106,7 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
   `).all(profile.id) as ChainRow[];
 }
 
-function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
+async function getChainByGlobalSort(db: Db, globalAxis: string): Promise<ChainRow[]> {
   // A global sort ignores the chain's ORDER, not its enable flags: a model the
   // operator switched off — in the catalog or just for auto routing — stays off
   // here too (#634). Models with no chain row yet (fresh catalog rows) default
@@ -1005,17 +1115,32 @@ function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
   const chainEnabled = profileId != null
     ? 'COALESCE(pm.enabled, fc.enabled, 1) = 1'
     : 'COALESCE(fc.enabled, 1) = 1';
-  const allEnabled = db.prepare(`
-    SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
-           m.platform, m.model_id, m.display_name, m.intelligence_rank,
-           m.size_label, m.monthly_token_budget,
-           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
-    FROM models m
-    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-    ${profileId != null ? 'LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id' : ''}
-    WHERE m.enabled = 1 AND ${chainEnabled}
-  `).all(...(profileId != null ? [profileId] : [])) as ChainRow[];
+  let allEnabled: ChainRow[];
+  if (isPostgres) {
+    allEnabled = await (db as PostgresDb).query(`
+      SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+      FROM models m
+      LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+      ${profileId != null ? 'LEFT JOIN profile_models pm ON pm.profile_id = $1 AND pm.model_db_id = m.id' : ''}
+      WHERE m.enabled = 1 AND ${chainEnabled}
+    `, ...(profileId != null ? [[profileId]] : [])) as ChainRow[];
+  } else {
+    allEnabled = db.prepare(`
+      SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+      FROM models m
+      LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+      ${profileId != null ? 'LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id' : ''}
+      WHERE m.enabled = 1 AND ${chainEnabled}
+    `).all(...(profileId != null ? [profileId] : [])) as ChainRow[];
+  }
 
   const strategyMap: Record<string, RoutingStrategy> = {
     'smart': 'smartest',
@@ -1026,29 +1151,29 @@ function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
   };
   const strat = strategyMap[globalAxis] || 'balanced';
   
-  return orderChain(allEnabled, strat);
+  return await orderChain(allEnabled, strat);
 }
 
-export function resolveRoutingChain(modelString: string | undefined): ResolvedChain {
+export async function resolveRoutingChain(modelString: string | undefined): Promise<ResolvedChain> {
   const db = getDb();
 
   if (!modelString || modelString.toLowerCase() === 'auto') {
-    return { chain: getActiveChain(db), strategyKey: 'auto' };
+    return { chain: await getActiveChain(db), strategyKey: 'auto' };
   }
 
   const lower = modelString.toLowerCase();
   if (!lower.startsWith('auto:')) {
-    return { chain: getActiveChain(db), strategyKey: 'auto' };
+    return { chain: await getActiveChain(db), strategyKey: 'auto' };
   }
 
   const suffix = lower.slice('auto:'.length).trim();
   if (!suffix) {
-    return { chain: getActiveChain(db), strategyKey: 'auto' };
+    return { chain: await getActiveChain(db), strategyKey: 'auto' };
   }
 
   const globalAxis = GLOBAL_SORT_ALIASES[suffix];
   if (globalAxis) {
-    const chain = getChainByGlobalSort(db, globalAxis);
+    const chain = await getChainByGlobalSort(db, globalAxis);
     if (chain.length === 0) {
       const err = new Error(`No enabled models available for global sort '${suffix}'`) as any;
       err.status = 400;
@@ -1057,7 +1182,7 @@ export function resolveRoutingChain(modelString: string | undefined): ResolvedCh
     return { chain, strategyKey: `auto:${globalAxis}` };
   }
 
-  const chain = getChainByProfileName(db, suffix);
+  const chain = await getChainByProfileName(db, suffix);
   if (!chain) {
     const err = new Error(`Profile '${suffix}' not found. Use 'auto' for the default profile, or call /v1/models for available options.`) as any;
     err.status = 400;
@@ -1118,7 +1243,7 @@ function orderKeysByScore(entry: ChainRow, keys: KeyRow[]): KeyRow[] | null {
  * Request-level filters (vision/tools/context window) stay in the caller; this
  * only does key selection + accounting pre-checks.
  */
-function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[]): RouteResult | null {
+async function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[]): Promise<RouteResult | null> {
   const db = getDb();
   const label = `${entry.platform}/${entry.model_id}`;
 
@@ -1128,9 +1253,17 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   }
   const provider = getProvider(entry.platform as Platform)!;
 
-  const allKeys = db.prepare(
-    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(entry.platform) as KeyRow[];
+  let allKeys: KeyRow[];
+  if (isPostgres) {
+    allKeys = await (db as PostgresDb).query(
+      "SELECT * FROM api_keys WHERE platform = $1 AND enabled = 1 AND status IN ('healthy', 'unknown')",
+      [entry.platform],
+    ) as KeyRow[];
+  } else {
+    allKeys = db.prepare(
+      "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+    ).all(entry.platform) as KeyRow[];
+  }
   if (allKeys.length === 0) {
     diag?.push(`${label}: no enabled+healthy key for platform`);
     return null;
@@ -1163,7 +1296,7 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   // failing key stops soaking up every Nth request. The stats cache is the same
   // 60s-TTL aggregate the model-level bandit uses (refresh is a no-op when
   // fresh, and cheap when not). With no data at all, keep the legacy rotation.
-  refreshStatsCache(db);
+  await refreshStatsCache(db);
   // Scoped so two relays offering the same model id don't share one rotation
   // cursor over the platform's key list (#651).
   const rrKey = modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope);
@@ -1205,8 +1338,15 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     try {
       decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
     } catch {
-      db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
-        .run(key.id);
+      if (isPostgres) {
+        await (db as PostgresDb).execute(
+          "UPDATE api_keys SET status = 'error', last_checked_at = NOW() WHERE id = $1",
+          [key.id],
+        );
+      } else {
+        db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
+          .run(key.id);
+      }
       note('decrypt-error');
       continue;
     }
@@ -1260,22 +1400,38 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
  * record the model-level hit when this returns false — i.e. the 429 exhausted the
  * model, not just one of its keys.
  */
-export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, skipKeys?: Set<string>): boolean {
+export async function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, skipKeys?: Set<string>): Promise<boolean> {
   const db = getDb();
-  const m = db.prepare(`
-    SELECT platform, model_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, key_id
-      FROM models WHERE id = ?
-  `).get(modelDbId) as {
+  let m: {
     platform: string; model_id: string;
     rpm_limit: number | null; rpd_limit: number | null;
     tpm_limit: number | null; tpd_limit: number | null; key_id: number | null;
   } | undefined;
+  if (isPostgres) {
+    m = await (db as PostgresDb).queryOne(
+      'SELECT platform, model_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, key_id FROM models WHERE id = $1',
+      [modelDbId],
+    ) as typeof m;
+  } else {
+    m = db.prepare(`
+      SELECT platform, model_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, key_id
+        FROM models WHERE id = ?
+    `).get(modelDbId) as typeof m;
+  }
   if (!m) return false;
 
   const limits = { rpm: m.rpm_limit, rpd: m.rpd_limit, tpm: m.tpm_limit, tpd: m.tpd_limit };
-  const keys = db.prepare(
-    "SELECT id, model_scope_json FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(m.platform) as { id: number; model_scope_json: string | null }[];
+  let keys: { id: number; model_scope_json: string | null }[];
+  if (isPostgres) {
+    keys = await (db as PostgresDb).query(
+      "SELECT id, model_scope_json FROM api_keys WHERE platform = $1 AND enabled = 1 AND status IN ('healthy', 'unknown')",
+      [m.platform],
+    ) as typeof keys;
+  } else {
+    keys = db.prepare(
+      "SELECT id, model_scope_json FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+    ).all(m.platform) as typeof keys;
+  }
 
   // Keys of the model's own custom endpoint (#212, #619); a key belonging to a
   // DIFFERENT endpoint cannot serve it, so it doesn't count as an alternative.
@@ -1312,15 +1468,31 @@ export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, ski
  * model-level bench, which needs the full key set to take a sick model out of
  * rotation, not "who could serve the next request".
  */
-export function routableKeyIdsForModel(modelDbId: number): number[] {
+export async function routableKeyIdsForModel(modelDbId: number): Promise<number[]> {
   const db = getDb();
-  const m = db.prepare('SELECT platform, model_id, key_id FROM models WHERE id = ?')
-    .get(modelDbId) as { platform: string; model_id: string; key_id: number | null } | undefined;
+  let m: { platform: string; model_id: string; key_id: number | null } | undefined;
+  if (isPostgres) {
+    m = await (db as PostgresDb).queryOne(
+      'SELECT platform, model_id, key_id FROM models WHERE id = $1',
+      [modelDbId],
+    ) as typeof m;
+  } else {
+    m = db.prepare('SELECT platform, model_id, key_id FROM models WHERE id = ?')
+      .get(modelDbId) as typeof m;
+  }
   if (!m) return [];
 
-  const keys = db.prepare(
-    "SELECT id, model_scope_json FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(m.platform) as { id: number; model_scope_json: string | null }[];
+  let keys: { id: number; model_scope_json: string | null }[];
+  if (isPostgres) {
+    keys = await (db as PostgresDb).query(
+      "SELECT id, model_scope_json FROM api_keys WHERE platform = $1 AND enabled = 1 AND status IN ('healthy', 'unknown')",
+      [m.platform],
+    ) as typeof keys;
+  } else {
+    keys = db.prepare(
+      "SELECT id, model_scope_json FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+    ).all(m.platform) as typeof keys;
+  }
 
   const endpointKeyIds = m.platform === 'custom' && m.key_id != null
     ? customEndpointKeyIds(db, m.key_id)
@@ -1335,7 +1507,18 @@ export function routableKeyIdsForModel(modelDbId: number): number[] {
 /**
  * Fetch a single enabled model's chain row by its db id.
  */
-function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
+async function getModelChainRow(db: Db, modelDbId: number): Promise<ChainRow | undefined> {
+  if (isPostgres) {
+    return (db as PostgresDb).queryOne(`
+      SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+      FROM models m
+      WHERE m.id = $1 AND m.enabled = 1
+    `, [modelDbId]) as Promise<ChainRow | undefined>;
+  }
   return db.prepare(`
     SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
@@ -1355,9 +1538,9 @@ function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
  * silently collapsed onto whatever else is available. `skipKeys` lets a slot
  * exclude keys it already failed on this request.
  */
-export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skipKeys?: Set<string>): RouteResult | null {
+export async function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skipKeys?: Set<string>): Promise<RouteResult | null> {
   const db = getDb();
-  const entry = getModelChainRow(db, modelDbId);
+  const entry = await getModelChainRow(db, modelDbId);
   if (!entry) return null;
   if (entry.context_window != null && estimatedTokens > entry.context_window) return null;
   if (entry.tpm_limit != null && estimatedTokens > entry.tpm_limit) return null;
@@ -1377,7 +1560,7 @@ export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skip
  * preferred-model injection in routeRequest would unshift an off-group model and
  * the pin would no longer be strict (it could answer with a different model).
  */
-export function resolveModelGroupCandidates(
+export async function resolveModelGroupCandidates(
   memberDbIds: number[],
   /**
    * Members that were reached only through a group's auto-derived slug, not the
@@ -1387,45 +1570,75 @@ export function resolveModelGroupCandidates(
    * which is what every other caller wants.
    */
   demotedDbIds?: ReadonlySet<number>,
-): ChainRow[] {
+): Promise<ChainRow[]> {
   const db = getDb();
   const strategy = getRoutingStrategy();
-  if (strategy !== 'priority') refreshStatsCache(db);
+  if (strategy !== 'priority') await refreshStatsCache(db);
 
   const activeProfileId = getActiveProfileId(db);
-  const selectMember = activeProfileId == null
-    ? db.prepare(`
-      SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
-             1 as enabled,
-             m.platform, m.model_id, m.display_name, m.intelligence_rank,
-             m.size_label, m.monthly_token_budget,
-             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
-      FROM models m
-      LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-      WHERE m.id = ? AND m.enabled = 1
-    `)
-    : db.prepare(`
-      SELECT m.id as model_db_id, COALESCE(pm.priority, fc.priority, 0) as priority,
-             1 as enabled,
-             m.platform, m.model_id, m.display_name, m.intelligence_rank,
-             m.size_label, m.monthly_token_budget,
-             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
-      FROM models m
-      LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
-      LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-      WHERE m.id = ? AND m.enabled = 1
-    `);
-
   const rows: ChainRow[] = [];
   for (const id of memberDbIds) {
-    const row = (activeProfileId == null ? selectMember.get(id) : selectMember.get(activeProfileId, id)) as ChainRow | undefined;
+    let row: ChainRow | undefined;
+    if (isPostgres) {
+      if (activeProfileId == null) {
+        row = await (db as PostgresDb).queryOne(`
+          SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
+                 1 as enabled,
+                 m.platform, m.model_id, m.display_name, m.intelligence_rank,
+                 m.size_label, m.monthly_token_budget,
+                 m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+                 m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+          FROM models m
+          LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+          WHERE m.id = $1 AND m.enabled = 1
+        `, [id]) as ChainRow | undefined;
+      } else {
+        row = await (db as PostgresDb).queryOne(`
+          SELECT m.id as model_db_id, COALESCE(pm.priority, fc.priority, 0) as priority,
+                 1 as enabled,
+                 m.platform, m.model_id, m.display_name, m.intelligence_rank,
+                 m.size_label, m.monthly_token_budget,
+                 m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+                 m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+          FROM models m
+          LEFT JOIN profile_models pm ON pm.profile_id = $1 AND pm.model_db_id = m.id
+          LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+          WHERE m.id = $2 AND m.enabled = 1
+        `, [activeProfileId, id]) as ChainRow | undefined;
+      }
+    } else {
+      if (activeProfileId == null) {
+        row = db.prepare(`
+          SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
+                 1 as enabled,
+                 m.platform, m.model_id, m.display_name, m.intelligence_rank,
+                 m.size_label, m.monthly_token_budget,
+                 m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+                 m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+          FROM models m
+          LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+          WHERE m.id = ? AND m.enabled = 1
+        `).get(id) as ChainRow | undefined;
+      } else {
+        row = db.prepare(`
+          SELECT m.id as model_db_id, COALESCE(pm.priority, fc.priority, 0) as priority,
+                 1 as enabled,
+                 m.platform, m.model_id, m.display_name, m.intelligence_rank,
+                 m.size_label, m.monthly_token_budget,
+                 m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+                 m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+          FROM models m
+          LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
+          LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+          WHERE m.id = ? AND m.enabled = 1
+        `).get(activeProfileId, id) as ChainRow | undefined;
+      }
+    }
     if (!row) continue;
     row.match_tier = demotedDbIds?.has(id) ? 1 : 0;
     rows.push(row);
   }
-  return orderChain(rows, strategy);
+  return await orderChain(rows, strategy);
 }
 
 // A panel candidate surfaced to the fusion layer: enough to pick a diverse set
@@ -1446,11 +1659,11 @@ export interface FusionCandidate {
  * so the panel's auto-pick draws from the highest-scored models first and the
  * fusion layer just needs to apply provider-diversity on top.
  */
-export function getOrderedFusionChain(estimatedTokens: number): FusionCandidate[] {
+export async function getOrderedFusionChain(estimatedTokens: number): Promise<FusionCandidate[]> {
   const db = getDb();
   const strategy = getRoutingStrategy();
-  if (strategy !== 'priority') refreshStatsCache(db);
-  const chain = getActiveChain(db).filter(e => e.enabled);
+  if (strategy !== 'priority') await refreshStatsCache(db);
+  const chain = (await getActiveChain(db)).filter(e => e.enabled);
 
   // Only consider models that can ACTUALLY be served RIGHT NOW — applying the
   // same gate selectKeyForModel uses when the router walks the chain: the model
@@ -1503,7 +1716,7 @@ export function getOrderedFusionChain(estimatedTokens: number): FusionCandidate[
 
   // Deterministic (expected-score) ordering so the panel faithfully follows the
   // user's picked routing strategy instead of re-sampling a fresh draw each call.
-  const ordered = orderChain(servable, strategy, false);
+  const ordered = await orderChain(servable, strategy, false);
   return ordered.map(e => ({
     modelDbId: e.model_db_id,
     platform: e.platform,
@@ -1550,10 +1763,29 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   // raw model_id. Resolve it to the group's best-ordered enabled member so
   // saved fusion configs that use canonical ids keep working. Exact model_id
   // match above always wins first, so OFF mode and legacy configs are untouched.
+  // NOTE: This path is async via resolveModelGroupCandidates but we cannot make
+  // this function async because it's used in sync filter callbacks (fusion.ts).
+  // Callers that need full group resolution should use resolveFusionCandidateAsync.
+  return null;
+}
+
+/**
+ * Async version of resolveFusionCandidate that also resolves canonical GROUP ids
+ * to their best member. Use this when the caller can await (e.g. inside selectPanel
+ * or getJudgeRoute). Falls back to the sync direct-model_id lookup first.
+ */
+export async function resolveFusionCandidateAsync(modelId: string): Promise<FusionCandidate | null> {
+  // Try the fast sync path first (direct model_id match).
+  const direct = resolveFusionCandidate(modelId);
+  if (direct) return direct;
+
+  // Unify ON: a fusion picker value may be a canonical GROUP id rather than a
+  // raw model_id. Resolve it to the group's best-ordered enabled member so
+  // saved fusion configs that use canonical ids keep working.
   if (isUnifyEnabled()) {
     const resolved = resolveRequestedIdForDispatch(modelId, getModelGroups());
     if (resolved && resolved.memberDbIds.length > 0) {
-      const top = resolveModelGroupCandidates(resolved.memberDbIds, resolved.demotedDbIds)[0];
+      const top = (await resolveModelGroupCandidates(resolved.memberDbIds, resolved.demotedDbIds))[0];
       if (top) {
         return {
           modelDbId: top.model_db_id,
@@ -1570,15 +1802,15 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   return null;
 }
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>): RouteResult {
+export async function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>): Promise<RouteResult> {
   const db = getDb();
 
   const strategy = getRoutingStrategy();
-  if (strategy !== 'priority') refreshStatsCache(db);
+  if (strategy !== 'priority') await refreshStatsCache(db);
 
-  const chain = (prefetchedChain ?? getActiveChain(db)).filter(e => e.enabled);
+  const chain = (prefetchedChain ?? await getActiveChain(db)).filter(e => e.enabled);
 
-  const sortedChain = orderChain(chain, strategy);
+  const sortedChain = await orderChain(chain, strategy);
 
   // Exploration toggle (#685/#707 follow-up): when enabled, give a model with
   // no reliability/speed samples a guaranteed chance to be tried, so it stops
@@ -1717,7 +1949,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // first usable key's RouteResult, or null when the model has no key that
     // can serve right now — in which case we fall through to the next model in
     // the sorted chain for THIS request (no explicit penalty needed).
-    const route = selectKeyForModel(entry, estimatedTokens, skipKeys, diag);
+    const route = await selectKeyForModel(entry, estimatedTokens, skipKeys, diag);
     if (route) return route;
   }
 
@@ -1744,12 +1976,12 @@ export interface RoutingScore {
   totalRequests: number; // decay-weighted observations
 }
 
-export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; exploreEnabled: boolean; scores: RoutingScore[] } {
+export async function getRoutingScores(): Promise<{ strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; exploreEnabled: boolean; scores: RoutingScore[] }> {
   const db = getDb();
   const strategy = getRoutingStrategy();
-  refreshStatsCache(db);
+  await refreshStatsCache(db);
 
-  const chain = getActiveChain(db);
+  const chain = await getActiveChain(db);
 
   // For display we score under 'balanced' weights when in priority mode, so the
   // table still shows a meaningful ranking even with the bandit turned off.
@@ -1757,7 +1989,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
   const composites = chain.map(e => intelligenceComposite(e.size_label, e.intelligence_rank));
   const intelMin = composites.length ? Math.min(...composites) : 0;
   const intelMax = composites.length ? Math.max(...composites) : 0;
-  const keyCounts = usableKeyCountsByPlatform(db);
+  const keyCounts = await usableKeyCountsByPlatform(db);
 
   const scores: RoutingScore[] = chain.map(entry => {
     const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts);
@@ -1801,9 +2033,9 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
  * Pass the same chain the request will route over (the prefetched auto chain);
  * omit it to check the active chain, which is what routeRequest would use.
  */
-export function resolveStickyPreference(stickyModelDbId: number | undefined, chain?: ChainRow[]): number | undefined {
+export async function resolveStickyPreference(stickyModelDbId: number | undefined, chain?: ChainRow[]): Promise<number | undefined> {
   if (stickyModelDbId == null) return undefined;
-  const rows = chain ?? getActiveChain(getDb());
+  const rows = chain ?? await getActiveChain(getDb());
   return rows.some(entry => entry.model_db_id === stickyModelDbId && entry.enabled)
     ? stickyModelDbId
     : undefined;
@@ -1812,15 +2044,15 @@ export function resolveStickyPreference(stickyModelDbId: number | undefined, cha
 // Whether at least one vision-capable model is enabled in the fallback chain.
 // Used to give image requests a clear "enable a vision model" error instead of
 // the generic exhaustion message when none is configured (#118, #125).
-export function hasEnabledVisionModel(): boolean {
+export async function hasEnabledVisionModel(): Promise<boolean> {
   const db = getDb();
-  return getActiveChain(db).some(entry => entry.enabled === 1 && entry.supports_vision === 1);
+  return (await getActiveChain(db)).some(entry => entry.enabled === 1 && entry.supports_vision === 1);
 }
 
 // Whether at least one tool-capable model is enabled in the fallback chain.
 // Same role as hasEnabledVisionModel: a clear up-front error for tool-bearing
 // requests beats routing them to a model that mangles the tool call.
-export function hasEnabledToolsModel(): boolean {
+export async function hasEnabledToolsModel(): Promise<boolean> {
   const db = getDb();
-  return getActiveChain(db).some(entry => entry.enabled === 1 && entry.supports_tools === 1);
+  return (await getActiveChain(db)).some(entry => entry.enabled === 1 && entry.supports_tools === 1);
 }

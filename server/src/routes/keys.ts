@@ -739,7 +739,7 @@ async function registerImportedModels(
       supportsTools: m.supportsTools,
       supportsVision: m.supportsVision,
     }));
-    registered += db.transaction(() => registerCustomChatModels(db, baseUrl, keyId, entries))().length;
+    registered += (await db.transaction(() => registerCustomChatModels(db, baseUrl, keyId, entries))()).length;
   }
 
   for (const m of embeds) {
@@ -1009,7 +1009,7 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
     return;
   }
 
-  const { keyId, storedKey, registered } = registerCustomModels(
+  const { keyId, storedKey, registered } = await registerCustomModels(
     db, baseUrl, providedKey, label, endpoint.keyId ?? undefined, entries,
   );
   // `model`/`displayName`/`modelDbId` echo the first model for older clients;

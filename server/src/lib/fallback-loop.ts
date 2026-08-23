@@ -82,7 +82,7 @@ const modelFailureTimestamps = new Map<number, number[]>(); // model_db_id → t
  *  holds ≥ MODEL_FAILURE_THRESHOLD failures, bench the model on EVERY key that
  *  can route to it so the model sinks out of routing until upstream heals, then
  *  reset the counter (one bench per streak). */
-function noteModelFailure(route: RouteResult, now: number): void {
+async function noteModelFailure(route: RouteResult, now: number): Promise<void> {
   const window = (modelFailureTimestamps.get(route.modelDbId) ?? [])
     .filter(t => now - t < MODEL_FAILURE_WINDOW_MS);
   window.push(now);
@@ -90,7 +90,7 @@ function noteModelFailure(route: RouteResult, now: number): void {
   if (window.length < MODEL_FAILURE_THRESHOLD) return;
   // Fall back to the failing key alone when the model's key set can't be read
   // (model row gone, DB unavailable) — a narrower bench beats none.
-  const keyIds = routableKeyIdsForModel(route.modelDbId);
+  const keyIds = await routableKeyIdsForModel(route.modelDbId);
   const targets = keyIds.length > 0 ? keyIds : [route.keyId];
   const benchUntil = now + MODEL_FAILURE_COOLDOWN_MS;
   const active = getActiveCooldownsForKeys(targets, now);
@@ -290,7 +290,7 @@ function consumeSkipBenchExemption(route: RouteResult, err: any): boolean {
  *
  * Callers add the just-failed key to skipKeys via this function (do not pre-add).
  */
-export function recordRetryableFailure(route: RouteResult, err: any, state: FallbackState, now: number = Date.now()): boolean {
+export async function recordRetryableFailure(route: RouteResult, err: any, state: FallbackState, now: number = Date.now()): Promise<boolean> {
   // `skipModelForRequest: true` = the failure is MODEL behavior, not key
   // state (ignored response_format, JSON truncated at max_tokens): a sibling
   // key would reproduce it exactly, so rule out the whole model for this
@@ -323,7 +323,7 @@ export function recordRetryableFailure(route: RouteResult, err: any, state: Fall
   setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
   // Model-level failure benching: a model failing across keys (or repeatedly on
   // one key) must sink out of routing instead of being re-picked every request.
-  noteModelFailure(route, now);
+  await noteModelFailure(route, now);
   // Model-level penalty only when no sibling key can still serve (#454).
   if (!hasOtherUsableKey(route.modelDbId, route.keyId, state.skipKeys)) {
     // Hard limit signals (429/402) carry the heavier demotion; ordinary
@@ -940,7 +940,7 @@ export interface FallbackHooks {
    * Throws the router's RouteError when the pool is exhausted before any
    * upstream is tried (caught by the loop → onRoutingExhausted).
    */
-  route(attempt: number): RouteResult;
+  route(attempt: number): Promise<RouteResult> | RouteResult;
 
   /**
    * Run one attempt against the chosen route. Return 'done' on success or
@@ -1074,7 +1074,7 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
 
     let route: RouteResult;
     try {
-      route = hooks.route(attempt);
+      route = await hooks.route(attempt);
     } catch (routeErr) {
       const exhaustion = lastError
         ? exhaustedRetryError(lastError, undefined, { attempts })

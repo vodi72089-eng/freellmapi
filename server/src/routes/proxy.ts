@@ -894,7 +894,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
   let resolvedChain: ResolvedChain | undefined;
   if (isAutoModel(requestedModel)) {
-    resolvedChain = resolveRoutingChain(requestedModel);
+    resolvedChain = await resolveRoutingChain(requestedModel);
   }
 
   let preferredModel: number | undefined;
@@ -905,7 +905,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
     const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
+      groupChain = await resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
         const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
@@ -981,7 +981,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     attemptLog,
     clientGone: () => clientGone,
     abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
-    route: () => routeRequest(
+    route: async () => routeRequest(
       estimatedTotal,
       state.skipKeys.size > 0 ? state.skipKeys : undefined,
       preferredModel,
@@ -1656,7 +1656,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let strategyKey: string | undefined;
 
   if (isAutoModel(requestedModel)) {
-    resolvedChain = resolveRoutingChain(requestedModel);
+    resolvedChain = await resolveRoutingChain(requestedModel);
     strategyKey = resolvedChain.strategyKey;
   }
 
@@ -1704,7 +1704,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let stickyStrategyKey: string | undefined = strategyKey;
 
   if (isAutoModel(requestedModel)) {
-    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
+    preferredModel = await resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   } else if (requestedModel) {
     const db = getDb();
     // Unify ON: a requested id (canonical slug OR any provider's model_id) maps
@@ -1713,8 +1713,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
     const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
-      if (groupChain.length === 0) {
+      groupChain = await resolveModelGroupCandidates(members, resolved!.demotedDbIds);
+      if (groupChain && groupChain.length === 0) {
         // Distinguish a catalog-disabled model (404 model_not_found, OpenAI
         // semantics) from one whose providers are present but unusable
         // (chain-disabled / no key) — the latter is a server-side
@@ -1745,7 +1745,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // Only prefer the sticky member if it's actually IN this group — passing a
       // non-member as preferredModelDbId would make routeRequest inject an
       // off-group model and break strict pinning.
-      preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
+      preferredModel = (sticky != null && groupChain && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
       // Unify OFF, or an id that isn't in the catalog: legacy single-row pin.
       const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
@@ -1765,7 +1765,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     }
   } else {
-    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
+    preferredModel = await resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
@@ -1806,7 +1806,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     attemptLog,
     clientGone: () => clientGone,
     abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
-    route: () => {
+    route: async () => {
       // When a handoff could fire this turn, pad the token estimate so the router's
       // context-window and TPM checks account for the extra system message overhead.
       // We don't know the selected model key until after routeRequest() returns, so
