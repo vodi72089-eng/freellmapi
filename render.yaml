@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: freellmapi
+    runtime: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: ENCRYPTION_KEY
+        generateValue: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
