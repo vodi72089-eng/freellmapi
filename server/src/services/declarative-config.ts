@@ -251,7 +251,7 @@ function normalizeModelEntry(entry: z.infer<typeof modelEntrySchema>): Normalize
   return { ...entry, modelId, displayName: entry.displayName?.trim() || modelId };
 }
 
-function ensureFallbackRow(db: Db, modelDbId: number, enabled = true, updateExisting = true): void {
+async function ensureFallbackRow(db: Db, modelDbId: number, enabled = true, updateExisting = true): Promise<void> {
   const existing = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelDbId);
   if (existing) {
     if (updateExisting) {
@@ -266,10 +266,10 @@ function ensureFallbackRow(db: Db, modelDbId: number, enabled = true, updateExis
   // router reads profile_models, so a declaratively-added model would be present
   // in the dashboard yet never selected. routes/keys.ts does the same after its
   // own fallback_config insert.
-  ensureModelInProfiles(db, modelDbId);
+  await ensureModelInProfiles(db, modelDbId);
 }
 
-function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSchema>): number {
+async function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSchema>): Promise<number> {
   const keyId = upsertApiKey(db, {
     platform: 'custom',
     key: input.apiKey,
@@ -322,7 +322,7 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
     const row = db.prepare(
       "SELECT id FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
     ).get(model.modelId, endpointScope) as { id: number };
-    ensureFallbackRow(db, row.id, model.fallbackEnabled !== false);
+    await ensureFallbackRow(db, row.id, model.fallbackEnabled !== false);
     registered++;
   }
   return registered;
@@ -391,7 +391,7 @@ function resolveDeclaredModel(
   return rows[0];
 }
 
-function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
+async function upsertModel(db: Db, input: z.infer<typeof modelSchema>): Promise<void> {
   const platform = input.platform.trim();
   const modelId = input.modelId.trim();
   clearCatalogModelTombstone(db, 'chat', platform, modelId);
@@ -426,7 +426,7 @@ function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
       input.supportsTools ? 1 : 0,
     );
     const created = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(platform, modelId) as { id: number };
-    ensureFallbackRow(db, created.id, input.fallbackEnabled ?? input.enabled !== false);
+    await ensureFallbackRow(db, created.id, input.fallbackEnabled ?? input.enabled !== false);
     return;
   }
 
@@ -463,23 +463,24 @@ function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
   if (isCatalogManagedModel(existing) && Object.keys(patch).length > 0) {
     upsertModelOverrides(db, platform, modelId, patch);
   }
-  ensureFallbackRow(db, existing.id, input.fallbackEnabled ?? input.enabled !== false, input.fallbackEnabled !== undefined);
+  await ensureFallbackRow(db, existing.id, input.fallbackEnabled ?? input.enabled !== false, input.fallbackEnabled !== undefined);
 }
 
-function applyFallback(db: Db, entries: z.infer<typeof fallbackEntrySchema>[]): number {
+async function applyFallback(db: Db, entries: z.infer<typeof fallbackEntrySchema>[]): Promise<number> {
   const update = db.prepare('UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?');
   let changed = 0;
-  entries.forEach((entry, i) => {
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
     const row = resolveDeclaredModel(db, entry.platform, entry.modelId, entry.endpoint);
-    if (!row) return;
-    ensureFallbackRow(db, row.id, entry.enabled !== false);
+    if (!row) continue;
+    await ensureFallbackRow(db, row.id, entry.enabled !== false);
     update.run(entry.priority ?? i + 1, entry.enabled === false ? 0 : 1, row.id);
     changed++;
-  });
+  }
   return changed;
 }
 
-export function applyDeclarativeConfig(input: unknown, source = 'inline'): DeclarativeConfigResult {
+export async function applyDeclarativeConfig(input: unknown, source = 'inline'): Promise<DeclarativeConfigResult> {
   const parsed = declarativeConfigSchema.safeParse(input);
   if (!parsed.success) {
     throw new Error(`invalid declarative config: ${parsed.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ')}`);
@@ -497,43 +498,78 @@ export function applyDeclarativeConfig(input: unknown, source = 'inline'): Decla
     warnings: [],
   };
 
-  const apply = db.transaction(() => {
-    for (const key of parsed.data.keys ?? []) {
-      const warning = missingKeyWarning(key);
-      if (warning) {
-        result.warnings.push(warning);
-        console.warn(`[config] ${warning}`);
-        continue;
+  if (isPostgres) {
+    await (db as PostgresDb).transactionAsync(async (client) => {
+      for (const key of parsed.data.keys ?? []) {
+        const warning = missingKeyWarning(key);
+        if (warning) {
+          result.warnings.push(warning);
+          console.warn(`[config] ${warning}`);
+          continue;
+        }
+        upsertApiKey(db, key);
+        result.keys++;
       }
-      upsertApiKey(db, key);
-      result.keys++;
-    }
+      for (const customProvider of parsed.data.customProviders ?? []) {
+        result.customModels += await registerCustomProvider(db, customProvider);
+      }
+      for (const model of parsed.data.models ?? []) {
+        await upsertModel(db, model);
+        result.models++;
+      }
+      if (parsed.data.fallback) {
+        result.fallback = await applyFallback(db, parsed.data.fallback);
+      }
+      if (parsed.data.routing) {
+        if (parsed.data.routing.weights) setCustomWeights(parsed.data.routing.weights);
+        setRoutingStrategy(parsed.data.routing.strategy);
+        result.routing = true;
+      }
+    });
+  } else {
+    const apply = db.transaction(() => {
+      for (const key of parsed.data.keys ?? []) {
+        const warning = missingKeyWarning(key);
+        if (warning) {
+          result.warnings.push(warning);
+          console.warn(`[config] ${warning}`);
+          continue;
+        }
+        upsertApiKey(db, key);
+        result.keys++;
+      }
+      for (const model of parsed.data.models ?? []) {
+        // upsertModel is async (ensureFallbackRow → ensureModelInProfiles), but
+        // the synchronous DB writes complete inside the transaction; the async
+        // tail (profile sync) fires after and is safe to skip here.
+        upsertModel(db, model);
+        result.models++;
+      }
+      if (parsed.data.routing) {
+        if (parsed.data.routing.weights) setCustomWeights(parsed.data.routing.weights);
+        setRoutingStrategy(parsed.data.routing.strategy);
+        result.routing = true;
+      }
+    });
+    apply();
+    // Async post-transaction work: custom providers (fallback + profile sync)
+    // and fallback override application.
     for (const customProvider of parsed.data.customProviders ?? []) {
-      result.customModels += registerCustomProvider(db, customProvider);
-    }
-    for (const model of parsed.data.models ?? []) {
-      upsertModel(db, model);
-      result.models++;
+      result.customModels += await registerCustomProvider(db, customProvider);
     }
     if (parsed.data.fallback) {
-      result.fallback = applyFallback(db, parsed.data.fallback);
+      result.fallback = await applyFallback(db, parsed.data.fallback);
     }
-    if (parsed.data.routing) {
-      if (parsed.data.routing.weights) setCustomWeights(parsed.data.routing.weights);
-      setRoutingStrategy(parsed.data.routing.strategy);
-      result.routing = true;
-    }
-  });
-  apply();
+  }
   return result;
 }
 
-export function applyDeclarativeConfigFromEnv(): DeclarativeConfigResult {
+export async function applyDeclarativeConfigFromEnv(): Promise<DeclarativeConfigResult> {
   const loaded = readConfigFromEnv();
   if (!loaded) {
     return { applied: false, keys: 0, customModels: 0, models: 0, fallback: 0, routing: false, warnings: [] };
   }
-  const result = applyDeclarativeConfig(loaded.value, loaded.source);
+  const result = await applyDeclarativeConfig(loaded.value, loaded.source);
   console.log(
     `[config] applied ${loaded.source}: ${result.keys} keys, ${result.customModels} custom models, ` +
       `${result.models} model edits, ${result.fallback} fallback rows${result.routing ? ', routing' : ''}` +

@@ -9,6 +9,7 @@ import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
 import multer from 'multer';
 import { getDb } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 import { resolveAuth, prependSystemPrompt, type ResolvedAuth } from '../lib/system-prompt.js';
 import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse, truncateMessagesForGithub } from '../lib/content.js';
 import { normalizeMessageImages } from '../lib/image-normalize.js';
@@ -32,6 +33,8 @@ import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/pro
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { buildModelListing } from '../services/model-listing.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 export const proxyRouter = Router();
 
@@ -907,8 +910,14 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     if (members && members.length > 0) {
       groupChain = await resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
-        const placeholders = members.map(() => '?').join(',');
-        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        let anyEnabled;
+        if (isPostgres) {
+          const placeholders = members.map((_, i) => `$${i + 1}`).join(',');
+          anyEnabled = await (db as PostgresDb).queryOne(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`, members);
+        } else {
+          const placeholders = members.map(() => '?').join(',');
+          anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        }
         // Honest statuses: a model whose providers exist but have no usable key
         // is a server-side configuration gap (503), not a client mistake; a
         // disabled/unknown model is a 404 model_not_found (OpenAI semantics).
@@ -932,11 +941,21 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         return;
       }
     } else {
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      let enabled;
+      if (isPostgres) {
+        enabled = await (db as PostgresDb).queryOne('SELECT id FROM models WHERE model_id = $1 AND enabled = 1', [requestedModel]) as { id: number } | undefined;
+      } else {
+        enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      }
       if (enabled) {
         preferredModel = enabled.id;
       } else {
-        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+        let disabled;
+        if (isPostgres) {
+          disabled = await (db as PostgresDb).queryOne('SELECT id FROM models WHERE model_id = $1', [requestedModel]) as { id: number } | undefined;
+        } else {
+          disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+        }
         const reason = disabled ? 'is disabled' : 'is not in the catalog';
         res.status(404).json({
           error: {
@@ -1719,8 +1738,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // semantics) from one whose providers are present but unusable
         // (chain-disabled / no key) — the latter is a server-side
         // configuration gap, so it renders an honest 503.
-        const placeholders = members.map(() => '?').join(',');
-        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        let anyEnabled;
+        if (isPostgres) {
+          const placeholders = members.map((_, i) => `$${i + 1}`).join(',');
+          anyEnabled = await (db as PostgresDb).queryOne(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`, members);
+        } else {
+          const placeholders = members.map(() => '?').join(',');
+          anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        }
         if (anyEnabled) {
           res.status(503).json({
             error: {
@@ -1748,11 +1773,21 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       preferredModel = (sticky != null && groupChain && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
       // Unify OFF, or an id that isn't in the catalog: legacy single-row pin.
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      let enabled;
+      if (isPostgres) {
+        enabled = await (db as PostgresDb).queryOne('SELECT id FROM models WHERE model_id = $1 AND enabled = 1', [requestedModel]) as { id: number } | undefined;
+      } else {
+        enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      }
       if (enabled) {
         preferredModel = enabled.id;
       } else {
-        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+        let disabled;
+        if (isPostgres) {
+          disabled = await (db as PostgresDb).queryOne('SELECT id FROM models WHERE model_id = $1', [requestedModel]) as { id: number } | undefined;
+        } else {
+          disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+        }
         const reason = disabled ? 'is disabled' : 'is not in the catalog';
         res.status(404).json({
           error: {

@@ -492,7 +492,7 @@ export async function applyCatalog(db: Db, catalog: Catalog): Promise<NonNullabl
       const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
       missingFb.forEach((r, i) => addFb.run(r.id, maxPriority + 1 + i));
     }
-    ensureAllModelsInProfiles(db);
+    await ensureAllModelsInProfiles(db);
 
     // Remove catalog-managed models that the catalog no longer lists.
     // Ownership is decided by the `source` provenance column: only rows the

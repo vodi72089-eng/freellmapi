@@ -185,7 +185,7 @@ export async function registerCustomChatModels(
         db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
       }
     }
-    ensureModelInProfiles(db, modelRow.id);
+    await ensureModelInProfiles(db, modelRow.id);
 
     registered.push({
       modelDbId: modelRow.id,

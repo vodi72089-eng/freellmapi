@@ -4,6 +4,7 @@ import { z } from 'zod';
 import multer from 'multer';
 import path from 'path';
 import { getDb } from '../db/index.js';
+import { PostgresDb } from '../db/postgres.js';
 import { resolveProvider, getAllProviders } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { parseKeysFromFile, stripJsoncComments, stripTrailingCommas } from '../lib/key-parser.js';
@@ -20,6 +21,8 @@ import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope
 import type { Db } from '../db/types.js';
 import { parseModelScope } from '../lib/model-scope.js';
 import { KEY_PROXY_URL_ERROR, KEY_PROXY_URL_MAX, decryptProxyUrl, encryptProxyUrl, isValidKeyProxyUrl, maskProxyUrl } from '../lib/key-proxy.js';
+
+const isPostgres = !!process.env.DATABASE_URL;
 
 export const keysRouter = Router();
 
@@ -147,10 +150,17 @@ function insertImportedKey(platform: (typeof PLATFORMS)[number], keyName: string
 
   const db = getDb();
   const { encrypted, iv, authTag } = encrypt(keyValue.trim());
-  db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-    VALUES (?, ?, ?, ?, ?, 'unknown', 1)
-  `).run(platform, keyName, encrypted, iv, authTag);
+  if (isPostgres) {
+    (db as PostgresDb).execute(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES ($1, $2, $3, $4, $5, 'unknown', 1)
+    `, [platform, keyName, encrypted, iv, authTag]);
+  } else {
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, 'unknown', 1)
+    `).run(platform, keyName, encrypted, iv, authTag);
+  }
 }
 
 // Count enabled catalog models for a platform. Used to warn when a key is
@@ -175,8 +185,15 @@ export function isExportableKey(row: { platform: string; baseUrl: string | null;
   return v.length > 0 && v !== 'no-key';
 }
 
-function enabledModelCount(platform: string): number {
+async function enabledModelCount(platform: string): Promise<number> {
   const db = getDb();
+  if (isPostgres) {
+    const row = await (db as PostgresDb).queryOne(
+      'SELECT COUNT(*) AS c FROM models WHERE platform = $1 AND enabled = 1',
+      [platform],
+    ) as { c: number };
+    return Number(row.c);
+  }
   const row = db.prepare(
     'SELECT COUNT(*) AS c FROM models WHERE platform = ? AND enabled = 1',
   ).get(platform) as { c: number };
@@ -185,8 +202,8 @@ function enabledModelCount(platform: string): number {
 
 // Non-null when the just-added key has no usable models yet, so the client can
 // explain the silence instead of leaving the user staring at an empty list.
-function noModelsNotice(platform: string): string | undefined {
-  if (enabledModelCount(platform) > 0) return undefined;
+async function noModelsNotice(platform: string): Promise<string | undefined> {
+  if (await enabledModelCount(platform) > 0) return undefined;
   return (
     `Key saved, but no ${platform} models are in your current catalog yet. ` +
     `Newer providers are published to the premium catalog first and appear ` +
@@ -201,16 +218,28 @@ function noModelsNotice(platform: string): string | undefined {
 // missing without enumerating the whole list by hand. `custom` is excluded —
 // it's a per-key user-defined placeholder, not a fixed free-tier provider to
 // "check off".
-keysRouter.get('/providers', (_req: Request, res: Response) => {
+keysRouter.get('/providers', async (_req: Request, res: Response) => {
   const db = getDb();
-  const countRows = db.prepare(`
-    SELECT
-      platform,
-      COUNT(*) AS total_keys,
-      SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled_keys
-    FROM api_keys
-    GROUP BY platform
-  `).all() as Array<{ platform: string; total_keys: number; enabled_keys: number }>;
+  let countRows: Array<{ platform: string; total_keys: number; enabled_keys: number }>;
+  if (isPostgres) {
+    countRows = await (db as PostgresDb).query(`
+      SELECT
+        platform,
+        COUNT(*) AS total_keys,
+        SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled_keys
+      FROM api_keys
+      GROUP BY platform
+    `) as Array<{ platform: string; total_keys: number; enabled_keys: number }>;
+  } else {
+    countRows = db.prepare(`
+      SELECT
+        platform,
+        COUNT(*) AS total_keys,
+        SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled_keys
+      FROM api_keys
+      GROUP BY platform
+    `).all() as Array<{ platform: string; total_keys: number; enabled_keys: number }>;
+  }
   const countsByPlatform = new Map(countRows.map(r => [r.platform, r]));
 
   const providers = getAllProviders()
@@ -241,27 +270,48 @@ keysRouter.get('/providers', (_req: Request, res: Response) => {
 });
 
 // List all keys (masked)
-keysRouter.get('/', (_req: Request, res: Response) => {
+keysRouter.get('/', async (_req: Request, res: Response) => {
   const db = getDb();
-  const rows = db.prepare('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
-
-  const customModels = [
-    ...db.prepare(`
+  let rows: any[];
+  let customModels: any[];
+  if (isPostgres) {
+    rows = await (db as PostgresDb).query('SELECT * FROM api_keys ORDER BY created_at DESC') as any[];
+    const chatModels = await (db as PostgresDb).query(`
       SELECT key_id, id, 'chat' AS kind, model_id, display_name, NULL AS family
         FROM models
        WHERE platform = 'custom' AND key_id IS NOT NULL
-    `).all() as any[],
-    ...db.prepare(`
+    `) as any[];
+    const embeddingModels = await (db as PostgresDb).query(`
       SELECT key_id, id, 'embedding' AS kind, model_id, display_name, family
         FROM embedding_models
        WHERE platform = 'custom' AND key_id IS NOT NULL
-    `).all() as any[],
-    ...db.prepare(`
+    `) as any[];
+    const mediaModels = await (db as PostgresDb).query(`
       SELECT key_id, id, modality AS kind, model_id, display_name, NULL AS family
         FROM media_models
        WHERE platform = 'custom' AND key_id IS NOT NULL
-    `).all() as any[],
-  ];
+    `) as any[];
+    customModels = [...chatModels, ...embeddingModels, ...mediaModels];
+  } else {
+    rows = db.prepare('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
+    customModels = [
+      ...db.prepare(`
+        SELECT key_id, id, 'chat' AS kind, model_id, display_name, NULL AS family
+          FROM models
+         WHERE platform = 'custom' AND key_id IS NOT NULL
+      `).all() as any[],
+      ...db.prepare(`
+        SELECT key_id, id, 'embedding' AS kind, model_id, display_name, family
+          FROM embedding_models
+         WHERE platform = 'custom' AND key_id IS NOT NULL
+      `).all() as any[],
+      ...db.prepare(`
+        SELECT key_id, id, modality AS kind, model_id, display_name, NULL AS family
+          FROM media_models
+         WHERE platform = 'custom' AND key_id IS NOT NULL
+      `).all() as any[],
+    ];
+  }
   // Models are grouped by ENDPOINT, not by key row: an endpoint can hold
   // several credentials (#619) while each model binds to just one of them, and
   // every one of those keys serves the endpoint's whole model list.
@@ -343,7 +393,7 @@ keysRouter.get('/', (_req: Request, res: Response) => {
 // Clear every active cooldown for one key. An escalated cooldown can bench a key
 // for up to 24h from a single bad window; once the operator has fixed the cause
 // there is otherwise no way back short of restarting and waiting it out.
-keysRouter.delete('/:id/cooldowns', (req: Request, res: Response) => {
+keysRouter.delete('/:id/cooldowns', async (req: Request, res: Response) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'Invalid key id' });
@@ -351,7 +401,12 @@ keysRouter.delete('/:id/cooldowns', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const exists = db.prepare('SELECT 1 FROM api_keys WHERE id = ?').get(id);
+  let exists: any;
+  if (isPostgres) {
+    exists = await (db as PostgresDb).queryOne('SELECT 1 FROM api_keys WHERE id = $1', [id]);
+  } else {
+    exists = db.prepare('SELECT 1 FROM api_keys WHERE id = ?').get(id);
+  }
   if (!exists) {
     res.status(404).json({ error: 'Key not found' });
     return;
@@ -388,7 +443,7 @@ function skipsReauth(req: Request): boolean {
 // The response is the raw file download (Content-Type varies by format).
 // Password re-verification via x-reauth-password header is required, except for
 // a local request on the desktop build (see skipsReauth).
-keysRouter.get('/export', (req: Request, res: Response) => {
+keysRouter.get('/export', async (req: Request, res: Response) => {
   const user = (req as any).user;
   if (!skipsReauth(req)) {
     const password = req.headers['x-reauth-password'] as string | undefined;
@@ -401,12 +456,20 @@ keysRouter.get('/export', (req: Request, res: Response) => {
   const format = (req.query.format as string) ?? 'json';
   const healthyOnly = req.query.healthy === 'true';
 
-  let whereClause = '';
-  if (healthyOnly) {
-    whereClause = "WHERE status = 'healthy'";
+  let rows: any[];
+  if (isPostgres) {
+    if (healthyOnly) {
+      rows = await (db as PostgresDb).query(`SELECT * FROM api_keys WHERE status = 'healthy' ORDER BY platform, created_at ASC`) as any[];
+    } else {
+      rows = await (db as PostgresDb).query(`SELECT * FROM api_keys ORDER BY platform, created_at ASC`) as any[];
+    }
+  } else {
+    let whereClause = '';
+    if (healthyOnly) {
+      whereClause = "WHERE status = 'healthy'";
+    }
+    rows = db.prepare(`SELECT * FROM api_keys ${whereClause} ORDER BY platform, created_at ASC`).all() as any[];
   }
-
-  const rows = db.prepare(`SELECT * FROM api_keys ${whereClause} ORDER BY platform, created_at ASC`).all() as any[];
 
   // Decrypt and filter — only export keys with a real value
   const decryptedKeys = rows
@@ -509,7 +572,7 @@ keysRouter.get('/export', (req: Request, res: Response) => {
 // session alone is not enough, the password has to be re-entered — except for a
 // local request on the desktop build, which has no password to re-enter (see
 // skipsReauth; a LAN client of that same desktop server still needs one).
-keysRouter.post('/:id/reveal', (req: Request, res: Response) => {
+keysRouter.post('/:id/reveal', async (req: Request, res: Response) => {
   const user = (req as any).user;
   if (!skipsReauth(req)) {
     const password = req.headers['x-reauth-password'] as string | undefined;
@@ -525,8 +588,13 @@ keysRouter.post('/:id/reveal', (req: Request, res: Response) => {
     return;
   }
 
-  const row = getDb().prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?')
-    .get(id) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+  let row: { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+  if (isPostgres) {
+    row = await (getDb() as PostgresDb).queryOne('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = $1', [id]) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+  } else {
+    row = getDb().prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?')
+      .get(id) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+  }
   if (!row) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
@@ -540,7 +608,7 @@ keysRouter.post('/:id/reveal', (req: Request, res: Response) => {
 });
 
 // Add a key
-keysRouter.post('/', (req: Request, res: Response) => {
+keysRouter.post('/', async (req: Request, res: Response) => {
   const parsed = addKeySchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -565,9 +633,18 @@ keysRouter.post('/', (req: Request, res: Response) => {
   // A keyless provider needs only one sentinel row — re-enable an existing one
   // instead of piling up duplicates each time the user clicks "Add".
   if (isKeyless) {
-    const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? LIMIT 1').get(platform) as { id: number } | undefined;
+    let existing: { id: number } | undefined;
+    if (isPostgres) {
+      existing = await (db as PostgresDb).queryOne('SELECT id FROM api_keys WHERE platform = $1 LIMIT 1', [platform]) as { id: number } | undefined;
+    } else {
+      existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? LIMIT 1').get(platform) as { id: number } | undefined;
+    }
     if (existing) {
-      db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE id = ?").run(existing.id);
+      if (isPostgres) {
+        await (db as PostgresDb).execute("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE id = $1", [existing.id]);
+      } else {
+        db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE id = ?").run(existing.id);
+      }
       res.status(200).json({
         id: existing.id,
         platform,
@@ -575,8 +652,8 @@ keysRouter.post('/', (req: Request, res: Response) => {
         maskedKey: maskKey(keyToStore),
         status: 'unknown',
         enabled: true,
-        modelsAvailable: enabledModelCount(platform),
-        notice: noModelsNotice(platform),
+        modelsAvailable: await enabledModelCount(platform),
+        notice: await noModelsNotice(platform),
       });
       return;
     }
@@ -587,13 +664,24 @@ keysRouter.post('/', (req: Request, res: Response) => {
   // `user:pass@` credentials. Absent/'' stores NULLs = no override.
   const proxyUrl = parsed.data.proxyUrl?.trim() ?? '';
   const proxy = encryptProxyUrl(proxyUrl);
-  const result = db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, proxy_encrypted, proxy_iv, proxy_auth_tag)
-    VALUES (?, ?, ?, ?, ?, 'unknown', 1, ?, ?, ?)
-  `).run(platform, label ?? '', encrypted, iv, authTag, proxy.encrypted, proxy.iv, proxy.authTag);
+  let newId: number;
+  if (isPostgres) {
+    const row = await (db as PostgresDb).queryOne(
+      `INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, proxy_encrypted, proxy_iv, proxy_auth_tag)
+       VALUES ($1, $2, $3, $4, $5, 'unknown', 1, $6, $7, $8) RETURNING id`,
+      [platform, label ?? '', encrypted, iv, authTag, proxy.encrypted, proxy.iv, proxy.authTag],
+    ) as { id: number };
+    newId = row.id;
+  } else {
+    const info = db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, proxy_encrypted, proxy_iv, proxy_auth_tag)
+      VALUES (?, ?, ?, ?, ?, 'unknown', 1, ?, ?, ?)
+    `).run(platform, label ?? '', encrypted, iv, authTag, proxy.encrypted, proxy.iv, proxy.authTag);
+    newId = Number(info.lastInsertRowid);
+  }
 
   res.status(201).json({
-    id: result.lastInsertRowid,
+    id: newId,
     platform,
     label: label ?? '',
     // Echoed back masked, never in the clear — the response body ends up in
@@ -602,8 +690,8 @@ keysRouter.post('/', (req: Request, res: Response) => {
     maskedKey: maskKey(keyToStore),
     status: 'unknown',
     enabled: true,
-    modelsAvailable: enabledModelCount(platform),
-    notice: noModelsNotice(platform),
+    modelsAvailable: await enabledModelCount(platform),
+    notice: await noModelsNotice(platform),
   });
 });
 
@@ -673,13 +761,18 @@ interface CustomEndpointRef {
  * of the custom-endpoint machinery addresses an endpoint. Throws a
  * `{ status, message }` for a reference that names nothing usable.
  */
-function resolveEndpointRef(ref: { keyId?: number; baseUrl?: string }): CustomEndpointRef {
+async function resolveEndpointRef(ref: { keyId?: number; baseUrl?: string }): Promise<CustomEndpointRef> {
   const db = getDb();
   const requestedBaseUrl = ref.baseUrl === undefined ? undefined : normalizeBaseUrl(ref.baseUrl);
 
   if (ref.keyId !== undefined) {
-    const row = db.prepare('SELECT id, platform, base_url, encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?')
-      .get(ref.keyId) as { id: number; platform: string; base_url: string | null; encrypted_key: string; iv: string; auth_tag: string } | undefined;
+    let row: { id: number; platform: string; base_url: string | null; encrypted_key: string; iv: string; auth_tag: string } | undefined;
+    if (isPostgres) {
+      row = await (db as PostgresDb).queryOne('SELECT id, platform, base_url, encrypted_key, iv, auth_tag FROM api_keys WHERE id = $1', [ref.keyId]) as typeof row;
+    } else {
+      row = db.prepare('SELECT id, platform, base_url, encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?')
+        .get(ref.keyId) as typeof row;
+    }
     if (!row || row.platform !== 'custom' || !row.base_url) {
       throw Object.assign(new Error('keyId does not name a custom endpoint'), { status: 400 });
     }
@@ -699,10 +792,18 @@ function resolveEndpointRef(ref: { keyId?: number; baseUrl?: string }): CustomEn
 
   // Any key of this base_url serves the whole endpoint (#619), so the first one
   // is as good a representative as any.
-  const rows = db.prepare(`
-    SELECT id, encrypted_key, iv, auth_tag FROM api_keys
-     WHERE platform = 'custom' AND base_url = ? ORDER BY id
-  `).all(requestedBaseUrl) as Array<{ id: number; encrypted_key: string; iv: string; auth_tag: string }>;
+  let rows: Array<{ id: number; encrypted_key: string; iv: string; auth_tag: string }>;
+  if (isPostgres) {
+    rows = await (db as PostgresDb).query(`
+      SELECT id, encrypted_key, iv, auth_tag FROM api_keys
+       WHERE platform = 'custom' AND base_url = $1 ORDER BY id
+    `, [requestedBaseUrl]) as typeof rows;
+  } else {
+    rows = db.prepare(`
+      SELECT id, encrypted_key, iv, auth_tag FROM api_keys
+       WHERE platform = 'custom' AND base_url = ? ORDER BY id
+    `).all(requestedBaseUrl) as typeof rows;
+  }
   for (const row of rows) {
     try {
       return { baseUrl: requestedBaseUrl, keyId: row.id, storedKey: decrypt(row.encrypted_key, row.iv, row.auth_tag) };
@@ -744,9 +845,17 @@ async function registerImportedModels(
 
   for (const m of embeds) {
     try {
-      const existing = db.prepare(
-        "SELECT dimensions FROM embedding_models WHERE platform = 'custom' AND model_id = ?",
-      ).get(m.id) as { dimensions: number } | undefined;
+      let existing: { dimensions: number } | undefined;
+      if (isPostgres) {
+        existing = await (db as PostgresDb).queryOne(
+          "SELECT dimensions FROM embedding_models WHERE platform = 'custom' AND model_id = $1",
+          [m.id],
+        ) as { dimensions: number } | undefined;
+      } else {
+        existing = db.prepare(
+          "SELECT dimensions FROM embedding_models WHERE platform = 'custom' AND model_id = ?",
+        ).get(m.id) as { dimensions: number } | undefined;
+      }
       const dimensions = existing?.dimensions ?? await probeEmbeddingDimensions(baseUrl, apiKey, m.id);
       registerCustomEmbeddingModel(db, {
         keyId,
@@ -802,7 +911,7 @@ keysRouter.post('/custom/discover-models', async (req: Request, res: Response) =
 
   let endpoint: CustomEndpointRef;
   try {
-    endpoint = resolveEndpointRef(parsed.data);
+    endpoint = await resolveEndpointRef(parsed.data);
   } catch (err: any) {
     res.status(err.status ?? 400).json({ error: { message: err.message } });
     return;
@@ -824,10 +933,19 @@ keysRouter.post('/custom/discover-models', async (req: Request, res: Response) =
     const registeredIds = new Set<string>();
     if (endpoint.keyId != null) {
       const poolIds = [...customEndpointKeyIds(db, endpoint.keyId)];
-      const placeholders = poolIds.map(() => '?').join(', ');
-      const rows = db.prepare(
-        `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders})`,
-      ).all(...poolIds) as { model_id: string }[];
+      let rows: { model_id: string }[];
+      if (isPostgres) {
+        const placeholders = poolIds.map((_, i) => `$${i + 1}`).join(', ');
+        rows = await (db as PostgresDb).query(
+          `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders})`,
+          poolIds,
+        ) as { model_id: string }[];
+      } else {
+        const placeholders = poolIds.map(() => '?').join(', ');
+        rows = db.prepare(
+          `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders})`,
+        ).all(...poolIds) as { model_id: string }[];
+      }
       for (const row of rows) registeredIds.add(row.model_id);
     }
 
@@ -863,7 +981,7 @@ keysRouter.post('/custom/probe', async (req: Request, res: Response) => {
 
   let endpoint: CustomEndpointRef;
   try {
-    endpoint = resolveEndpointRef(parsed.data);
+    endpoint = await resolveEndpointRef(parsed.data);
   } catch (err: any) {
     res.status(err.status ?? 400).json({ error: { message: err.message } });
     return;
@@ -882,10 +1000,19 @@ keysRouter.post('/custom/probe', async (req: Request, res: Response) => {
   if (endpoint.keyId != null) {
     const db = getDb();
     const poolIds = [...customEndpointKeyIds(db, endpoint.keyId)];
-    const placeholders = poolIds.map(() => '?').join(', ');
-    const row = db.prepare(
-      `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders}) ORDER BY id LIMIT 1`,
-    ).get(...poolIds) as { model_id: string } | undefined;
+    let row: { model_id: string } | undefined;
+    if (isPostgres) {
+      const placeholders = poolIds.map((_, i) => `$${i + 1}`).join(', ');
+      row = await (db as PostgresDb).queryOne(
+        `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders}) ORDER BY id LIMIT 1`,
+        poolIds,
+      ) as { model_id: string } | undefined;
+    } else {
+      const placeholders = poolIds.map(() => '?').join(', ');
+      row = db.prepare(
+        `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders}) ORDER BY id LIMIT 1`,
+      ).get(...poolIds) as { model_id: string } | undefined;
+    }
     registeredModelId = row?.model_id ?? null;
   }
 
@@ -895,10 +1022,17 @@ keysRouter.post('/custom/probe', async (req: Request, res: Response) => {
     // Only a successful probe records a sample. The row mirrors what the proxy
     // writes on a real request so the decay-weighted stats cache picks it up.
     if (endpoint.keyId != null) {
-      getDb().prepare(`
-        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, ttfb_ms, request_type)
-        VALUES ('custom', ?, ?, 'success', ?, ?, ?, ?, 'chat')
-      `).run(probe.modelId, endpoint.keyId, probe.inputTokens, probe.outputTokens, probe.latencyMs, probe.latencyMs);
+      if (isPostgres) {
+        await (getDb() as PostgresDb).execute(`
+          INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, ttfb_ms, request_type)
+          VALUES ('custom', $1, $2, 'success', $3, $4, $5, $6, 'chat')
+        `, [probe.modelId, endpoint.keyId, probe.inputTokens, probe.outputTokens, probe.latencyMs, probe.latencyMs]);
+      } else {
+        getDb().prepare(`
+          INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, ttfb_ms, request_type)
+          VALUES ('custom', ?, ?, 'success', ?, ?, ?, ?, 'chat')
+        `).run(probe.modelId, endpoint.keyId, probe.inputTokens, probe.outputTokens, probe.latencyMs, probe.latencyMs);
+      }
 
       // A real completion just succeeded, which is stronger evidence than any
       // health ping — lift whatever cooldown was still holding the key back.
@@ -924,7 +1058,7 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
 
   let endpoint: CustomEndpointRef;
   try {
-    endpoint = resolveEndpointRef(parsed.data);
+    endpoint = await resolveEndpointRef(parsed.data);
   } catch (err: any) {
     res.status(err.status ?? 400).json({ error: { message: err.message } });
     return;
@@ -1131,7 +1265,7 @@ keysRouter.post('/import', (req: Request, res: Response, next: NextFunction) => 
 });
 
 keysRouter.post('/preview', (req: Request, res: Response, next: NextFunction) => {
-  upload.array('files', 10)(req, res, (err: any) => {
+  upload.array('files', 10)(req, res, async (err: any) => {
     if (handleUploadError(err, res, next)) return;
 
     try {
@@ -1150,7 +1284,12 @@ keysRouter.post('/preview', (req: Request, res: Response, next: NextFunction) =>
 
       // Build a set of existing decrypted key values for duplicate detection
       const db = getDb();
-      const existingRows = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys').all() as any[];
+      let existingRows: any[];
+      if (isPostgres) {
+        existingRows = await (db as PostgresDb).query('SELECT encrypted_key, iv, auth_tag FROM api_keys') as any[];
+      } else {
+        existingRows = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys').all() as any[];
+      }
       const existingKeys = new Set<string>();
       for (const row of existingRows) {
         try {
@@ -1204,7 +1343,12 @@ keysRouter.post('/import-selected', async (req: Request, res: Response) => {
 
   // Build a set of existing decrypted key values for duplicate detection
   const db = getDb();
-  const existingRows = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys').all() as any[];
+  let existingRows: any[];
+  if (isPostgres) {
+    existingRows = await (db as PostgresDb).query('SELECT encrypted_key, iv, auth_tag FROM api_keys') as any[];
+  } else {
+    existingRows = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys').all() as any[];
+  }
   const existingKeys = new Set<string>();
   for (const row of existingRows) {
     try {
@@ -1284,7 +1428,7 @@ keysRouter.post('/import-selected', async (req: Request, res: Response) => {
 });
 
 // Delete a key
-keysRouter.delete('/:id', (req: Request, res: Response) => {
+keysRouter.delete('/:id', async (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
@@ -1292,7 +1436,12 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const row = db.prepare('SELECT platform, base_url FROM api_keys WHERE id = ?').get(id) as { platform: string; base_url: string | null } | undefined;
+  let row: { platform: string; base_url: string | null } | undefined;
+  if (isPostgres) {
+    row = await (db as PostgresDb).queryOne('SELECT platform, base_url FROM api_keys WHERE id = $1', [id]) as typeof row;
+  } else {
+    row = db.prepare('SELECT platform, base_url FROM api_keys WHERE id = ?').get(id) as typeof row;
+  }
   if (!row) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
@@ -1301,52 +1450,87 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   // over to it instead of being cascaded away with this key (#619).
   const sibling = row.platform === 'custom' ? siblingEndpointKeyId(db, id, row.base_url) : null;
 
-  const remove = db.transaction(() => {
-    if (sibling != null) {
-      for (const table of ['models', 'embedding_models', 'media_models']) {
-        db.prepare(`UPDATE ${table} SET key_id = ? WHERE platform = 'custom' AND key_id = ?`).run(sibling, id);
+  if (isPostgres) {
+    await (db as PostgresDb).transactionAsync(async (client) => {
+      if (sibling != null) {
+        for (const table of ['models', 'embedding_models', 'media_models']) {
+          await client.query(`UPDATE ${table} SET key_id = $1 WHERE platform = 'custom' AND key_id = $2`, [sibling, id]);
+        }
+        await client.query('DELETE FROM api_keys WHERE id = $1', [id]);
+        return;
       }
-      db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
-      return;
-    }
 
-    db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
-    // Custom models exist only because POST /custom registered them alongside
-    // their endpoint key (#117) — they can't route without it. Cascade away
-    // the models bound to THIS endpoint (#212); other custom providers keep
-    // theirs. Legacy rows (key_id NULL) are swept once no custom keys remain,
-    // so they never linger in the fallback chain forever (#189).
-    if (row.platform === 'custom') {
-      const defaultEmbedding = db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string } | undefined;
-      db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
-      db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
-      db.prepare("DELETE FROM embedding_models WHERE platform = 'custom' AND key_id = ?").run(id);
-      db.prepare("DELETE FROM media_models WHERE platform = 'custom' AND key_id = ?").run(id);
-      const remaining = db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'custom'").get() as { n: number };
-      if (remaining.n === 0) {
-        db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
-        db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
-        db.prepare("DELETE FROM embedding_models WHERE platform = 'custom'").run();
-        db.prepare("DELETE FROM media_models WHERE platform = 'custom'").run();
-      }
-      if (defaultEmbedding) {
-        const stillExists = db.prepare('SELECT 1 FROM embedding_models WHERE family = ? LIMIT 1').get(defaultEmbedding.value);
-        if (!stillExists) {
-          const replacement = db.prepare('SELECT family FROM embedding_models ORDER BY family, priority LIMIT 1').get() as { family: string } | undefined;
-          if (replacement) {
-            db.prepare("UPDATE settings SET value = ? WHERE key = 'embeddings_default_family'").run(replacement.family);
+      await client.query('DELETE FROM api_keys WHERE id = $1', [id]);
+      if (row!.platform === 'custom') {
+        const defaultEmbeddingResult = await client.query("SELECT value FROM settings WHERE key = 'embeddings_default_family'");
+        const defaultEmbedding = defaultEmbeddingResult.rows as { value: string }[];
+        await client.query("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = $1)", [id]);
+        await client.query("DELETE FROM models WHERE platform = 'custom' AND key_id = $1", [id]);
+        await client.query("DELETE FROM embedding_models WHERE platform = 'custom' AND key_id = $1", [id]);
+        await client.query("DELETE FROM media_models WHERE platform = 'custom' AND key_id = $1", [id]);
+        const remainingResult = await client.query("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'custom'");
+        const remaining = remainingResult.rows as { n: number }[];
+        if (remaining[0]?.n === 0) {
+          await client.query("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')");
+          await client.query("DELETE FROM models WHERE platform = 'custom'");
+          await client.query("DELETE FROM embedding_models WHERE platform = 'custom'");
+          await client.query("DELETE FROM media_models WHERE platform = 'custom'");
+        }
+        if (defaultEmbedding[0]) {
+          const stillExistsResult = await client.query('SELECT 1 FROM embedding_models WHERE family = $1 LIMIT 1', [defaultEmbedding[0].value]);
+          if (stillExistsResult.rows.length === 0) {
+            const replacementResult = await client.query('SELECT family FROM embedding_models ORDER BY family, priority LIMIT 1');
+            const replacement = replacementResult.rows as { family: string }[];
+            if (replacement[0]) {
+              await client.query("UPDATE settings SET value = $1 WHERE key = 'embeddings_default_family'", [replacement[0].family]);
+            }
           }
         }
       }
-    }
-  });
-  remove();
+    });
+  } else {
+    const remove = db.transaction(() => {
+      if (sibling != null) {
+        for (const table of ['models', 'embedding_models', 'media_models']) {
+          db.prepare(`UPDATE ${table} SET key_id = ? WHERE platform = 'custom' AND key_id = ?`).run(sibling, id);
+        }
+        db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+        return;
+      }
+
+      db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+      if (row!.platform === 'custom') {
+        const defaultEmbedding = db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string } | undefined;
+        db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
+        db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
+        db.prepare("DELETE FROM embedding_models WHERE platform = 'custom' AND key_id = ?").run(id);
+        db.prepare("DELETE FROM media_models WHERE platform = 'custom' AND key_id = ?").run(id);
+        const remaining = db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'custom'").get() as { n: number };
+        if (remaining.n === 0) {
+          db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
+          db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
+          db.prepare("DELETE FROM embedding_models WHERE platform = 'custom'").run();
+          db.prepare("DELETE FROM media_models WHERE platform = 'custom'").run();
+        }
+        if (defaultEmbedding) {
+          const stillExists = db.prepare('SELECT 1 FROM embedding_models WHERE family = ? LIMIT 1').get(defaultEmbedding.value);
+          if (!stillExists) {
+            const replacement = db.prepare('SELECT family FROM embedding_models ORDER BY family, priority LIMIT 1').get() as { family: string } | undefined;
+            if (replacement) {
+              db.prepare("UPDATE settings SET value = ? WHERE key = 'embeddings_default_family'").run(replacement.family);
+            }
+          }
+        }
+      }
+    });
+    remove();
+  }
 
   res.json({ success: true });
 });
 
 // Toggle all keys for a platform
-keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
+keysRouter.patch('/platform/:platform', async (req: Request, res: Response) => {
   const platform = req.params.platform as string;
   if (!(PLATFORMS as readonly string[]).includes(platform)) {
     res.status(400).json({ error: { message: `Invalid platform '${platform}'` } });
@@ -1360,13 +1544,20 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
+  let updatedKeys: number;
+  if (isPostgres) {
+    const result = await (db as PostgresDb).execute('UPDATE api_keys SET enabled = $1 WHERE platform = $2', [enabled ? 1 : 0, platform]);
+    updatedKeys = result.rowCount ?? 0;
+  } else {
+    const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
+    updatedKeys = result.changes;
+  }
 
-  res.json({ success: true, enabled, updatedKeys: result.changes });
+  res.json({ success: true, enabled, updatedKeys });
 });
 
 // Update key (toggle enable/disable or edit label)
-keysRouter.patch('/:id', (req: Request, res: Response) => {
+keysRouter.patch('/:id', async (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
@@ -1384,33 +1575,44 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
   const values: (string | number | null)[] = [];
 
   if (enabled !== undefined) {
-    updates.push('enabled = ?');
+    updates.push(isPostgres ? `enabled = $${updates.length + 1}` : 'enabled = ?');
     values.push(enabled ? 1 : 0);
   }
   if (label !== undefined) {
-    updates.push('label = ?');
+    updates.push(isPostgres ? `label = $${updates.length + 1}` : 'label = ?');
     values.push(label);
   }
   // #590: stored encrypted (credentials), so a change rewrites all three
   // columns; '' clears them to NULL.
   if (proxyUrl !== undefined) {
     const proxy = encryptProxyUrl(proxyUrl);
-    updates.push('proxy_encrypted = ?', 'proxy_iv = ?', 'proxy_auth_tag = ?');
+    if (isPostgres) {
+      updates.push(`proxy_encrypted = $${updates.length + 1}`, `proxy_iv = $${updates.length + 2}`, `proxy_auth_tag = $${updates.length + 3}`);
+    } else {
+      updates.push('proxy_encrypted = ?', 'proxy_iv = ?', 'proxy_auth_tag = ?');
+    }
     values.push(proxy.encrypted, proxy.iv, proxy.authTag);
   }
   // Deduped; an empty result stores NULL, which the router reads as "unscoped".
   const scopeIds = modelScope == null ? [] : [...new Set(modelScope)];
   if (modelScope !== undefined) {
-    updates.push('model_scope_json = ?');
+    updates.push(isPostgres ? `model_scope_json = $${updates.length + 1}` : 'model_scope_json = ?');
     values.push(scopeIds.length > 0 ? JSON.stringify(scopeIds) : null);
   }
 
   values.push(id);
 
   const db = getDb();
-  const result = db.prepare(`UPDATE api_keys SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  let updated: boolean;
+  if (isPostgres) {
+    const result = await (db as PostgresDb).execute(`UPDATE api_keys SET ${updates.join(', ')} WHERE id = $${values.length}`, values);
+    updated = (result.rowCount ?? 0) > 0;
+  } else {
+    const result = db.prepare(`UPDATE api_keys SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    updated = result.changes > 0;
+  }
 
-  if (result.changes === 0) {
+  if (!updated) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
   }

@@ -1013,7 +1013,7 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
 };
 
 async function getActiveChain(db: Db): Promise<ChainRow[]> {
-  const profileId = getActiveProfileId(db);
+  const profileId = await getActiveProfileId(db);
   if (profileId != null) {
     let chain: ChainRow[];
     if (isPostgres) {
@@ -1111,7 +1111,7 @@ async function getChainByGlobalSort(db: Db, globalAxis: string): Promise<ChainRo
   // operator switched off — in the catalog or just for auto routing — stays off
   // here too (#634). Models with no chain row yet (fresh catalog rows) default
   // to in, so the sort still spans the whole catalog.
-  const profileId = getActiveProfileId(db);
+  const profileId = await getActiveProfileId(db);
   const chainEnabled = profileId != null
     ? 'COALESCE(pm.enabled, fc.enabled, 1) = 1'
     : 'COALESCE(fc.enabled, 1) = 1';
@@ -1575,7 +1575,7 @@ export async function resolveModelGroupCandidates(
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') await refreshStatsCache(db);
 
-  const activeProfileId = getActiveProfileId(db);
+  const activeProfileId = await getActiveProfileId(db);
   const rows: ChainRow[] = [];
   for (const id of memberDbIds) {
     let row: ChainRow | undefined;
