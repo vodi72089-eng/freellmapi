@@ -22,7 +22,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const db = connectDb();
+  const db = await connectDb();
 
   switch (command) {
     case 'up':

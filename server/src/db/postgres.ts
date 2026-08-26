@@ -41,7 +41,7 @@ export class PostgresDb implements Db {
   pool: Pool;
 
   constructor(pool?: Pool) {
-    this.pool = pool ?? getPool();
+    this.pool = pool!;
   }
 
   prepare(sql: string): DbStatement {
@@ -118,6 +118,7 @@ export class PostgresDb implements Db {
   }
 }
 
-export function createPostgresDb(pool?: Pool): PostgresDb {
-  return new PostgresDb(pool);
+export async function createPostgresDb(pool?: Pool): Promise<PostgresDb> {
+  const resolvedPool = pool ?? await getPool();
+  return new PostgresDb(resolvedPool);
 }

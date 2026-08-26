@@ -45,12 +45,18 @@ function betterSqliteFactory(resolvedPath: string): Db {
 
 export function defaultDbFactory(platform: NodeJS.Platform = process.platform): DbFactory {
   if (process.env.DATABASE_URL) {
-    return () => createPostgresDb();
+    // PostgreSQL factory: pool is initialized lazily in connectPostgresDb
+    return () => ({ isPostgres: true } as unknown as Db);
   }
   return platform === 'android' ? nodeSqliteFactory : betterSqliteFactory;
 }
 
-export function connectDb(
+export async function connectPostgresDb(): Promise<Db> {
+  const { createPostgresDb } = await import('./postgres.js');
+  return await createPostgresDb();
+}
+
+export async function connectDb(
   dbPath?: string,
   opts?: {
     /** Create the parent directory if absent. Default: true. Set false in
@@ -59,7 +65,7 @@ export function connectDb(
     /** Factory that constructs the raw Db connection. Default: better-sqlite3. */
     factory?: DbFactory;
   },
-): Db {
+): Promise<Db> {
   const isPostgres = !!process.env.DATABASE_URL;
   const resolvedPath = dbPath ?? getDefaultDbPath();
   const isMemory = resolvedPath === ':memory:';
@@ -81,6 +87,10 @@ export function connectDb(
   }
 
   db = factory(resolvedPath);
+  // PostgreSQL: initialize the real pool after factory creates placeholder
+  if (isPostgres) {
+    db = await connectPostgresDb();
+  }
   // SQLite-specific pragmas — only apply when not using PostgreSQL
   if (!isPostgres) {
     if (!isMemory) db.pragma('journal_mode = WAL');
@@ -199,11 +209,11 @@ function restrictDbFilePermissions(resolvedPath: string): void {
   }
 }
 
-export function initDb(
+export async function initDb(
   dbPath?: string,
   opts?: { ensureDir?: boolean; factory?: DbFactory },
-): Db {
-  const db = connectDb(dbPath, opts);
+): Promise<Db> {
+  const db = await connectDb(dbPath, opts);
 
   if (process.env.DATABASE_URL) {
     // PostgreSQL: run async migrations — store the promise so callers can

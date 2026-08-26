@@ -40,7 +40,7 @@ async function main() {
   } else {
     await restoreDbBackupIfNeeded();
   }
-  initDb(config.dbPath ?? undefined);
+  await initDb(config.dbPath ?? undefined);
   await waitForDbReady();
   await applyDeclarativeConfigFromEnv();
   // After initDb: the unknown-model half of this check reads the catalog.
