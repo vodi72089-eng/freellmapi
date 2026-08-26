@@ -206,8 +206,11 @@ export function initDb(
   const db = connectDb(dbPath, opts);
 
   if (process.env.DATABASE_URL) {
-    // PostgreSQL: run async migrations
-    runMigrations(db, 'up').catch(err => {
+    // PostgreSQL: run async migrations — store the promise so callers can
+    // await readiness before hitting the DB.
+    _postgresReady = runMigrations(db, 'up').then(() => {
+      console.log('[db] PostgreSQL migrations complete');
+    }).catch(err => {
       console.error('PostgreSQL migration error:', err);
       process.exit(1);
     });
@@ -231,6 +234,13 @@ export function initDb(
   if (!isEncryptionKeyInitialized()) initEncryptionKey(db);
 
   return db;
+}
+
+/** Await this before calling sync DB helpers in PostgreSQL mode. */
+let _postgresReady: Promise<void> | null = null;
+
+export async function waitForDbReady(): Promise<void> {
+  if (_postgresReady) await _postgresReady;
 }
 
 export function getUnifiedApiKey(): string {

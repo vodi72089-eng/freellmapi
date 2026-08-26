@@ -1,6 +1,6 @@
 import './env.js';
 import { createApp } from './app.js';
-import { initDb, getDb } from './db/index.js';
+import { initDb, getDb, waitForDbReady } from './db/index.js';
 import { startHealthChecker, checkAllKeys } from './services/health.js';
 import { restoreProxySettings, flushProxyCache } from './lib/proxy.js';
 import { startWakeDetect } from './lib/wake-detect.js';
@@ -41,6 +41,7 @@ async function main() {
     await restoreDbBackupIfNeeded();
   }
   initDb(config.dbPath ?? undefined);
+  await waitForDbReady();
   await applyDeclarativeConfigFromEnv();
   // After initDb: the unknown-model half of this check reads the catalog.
   warnOnRoutingOverrideDrift();
@@ -50,7 +51,12 @@ async function main() {
   // again — retired models, deleted keys, a shutdown taken while everything was
   // benched — would otherwise stay in the table forever and weigh down every
   // cooldown rollup. One sweep at boot, while the DB is quiet.
-  const expiredCooldowns = cleanupExpiredCooldowns();
+  let expiredCooldowns = 0;
+  try {
+    expiredCooldowns = cleanupExpiredCooldowns();
+  } catch {
+    // PostgreSQL: sync methods not available; cooldowns will be cleaned lazily
+  }
   if (expiredCooldowns > 0) {
     console.log(`[ratelimit] cleared ${expiredCooldowns} expired cooldown${expiredCooldowns === 1 ? '' : 's'}`);
   }
@@ -58,13 +64,22 @@ async function main() {
   // First-run hardening: when the dashboard is still unclaimed, mint a one-time
   // setup code and log it. A loopback browser can finish setup without it; a
   // remote caller must supply it (see routes/auth.ts). Regenerated each boot.
-  if (userCount() === 0) {
+  try {
+    if (userCount() === 0) {
+      generateSetupCode();
+    }
+  } catch {
+    // PostgreSQL: sync methods not available; generate setup code on first use
     generateSetupCode();
   }
 
   // Load the persisted proxy settings from the DB (env var wins if set).
   // Must happen after initDb so the settings table is ready.
-  restoreProxySettings();
+  try {
+    restoreProxySettings();
+  } catch {
+    // PostgreSQL: sync methods not available; proxy settings will be restored on first use
+  }
 
   const app = createApp(config);
 
